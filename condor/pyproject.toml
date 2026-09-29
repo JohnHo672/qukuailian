@@ -1,0 +1,56 @@
+[project]
+name = "condor"
+version = "0.1.0"
+description = "Telegram bot for Hummingbot trading via Backend API"
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot[job-queue]",
+    "hummingbot-api-client==1.5.9",
+    "python-dotenv",
+    "PyYAML",
+    "aiohttp",
+    "watchfiles",
+    "kaleido",
+    "plotly",
+    "pandas",
+    # Technical analysis. Pinned to the same floor Hummingbot core and the
+    # hummingbot-api image use (setup.py / environment.yml: pandas-ta>=0.4.71b),
+    # so a routine's indicators match what a controller or a backtest computes.
+    # It pins numba==0.61.2, which caps numpy at <2.3 — that is also the numpy
+    # the API container runs (2.2.6), so the two environments stay aligned.
+    "pandas-ta>=0.4.71b",
+    "geckoterminal-py",
+    "mcp",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-jose[cryptography]",
+    "faster-whisper",
+    "matplotlib>=3.10.8",
+    "scipy>=1.17.1",
+    "pydantic-ai[mcp]",
+    "beautifulsoup4>=4.14.3",
+    "markdown>=3.10.2",
+    "bleach>=6.4.0",
+    "yfinance>=1.7.0",
+    # Web Push (FEAT-083): VAPID signing + RFC 8291 payload encryption, so a
+    # notification's text is readable only by the browser that subscribed.
+    # Brings py-vapid and http-ece; cryptography was already here via
+    # python-jose[cryptography].
+    "pywebpush>=2.5.0",
+]
+
+[dependency-groups]
+# PEP 735 group: this is what ``uv sync --dev`` installs. Declared as an
+# optional-dependencies extra it was invisible to ``--dev``, so CI ran
+# ``black --check`` with no black on PATH and failed to spawn it.
+dev = ["pytest", "pytest-asyncio", "black", "isort", "pre-commit"]
+
+[tool.isort]
+profile = "black"
+
+[tool.setuptools.package-data]
+"condor.reports" = ["report_runtime.js"]
+# The BIP-39 English wordlist. Vendored rather than depended on, and shipped
+# here rather than assumed present: without it the ingress scrubber degrades to
+# no recovery-phrase detection at all, silently.
+"condor.runtime" = ["bip39_english.txt"]

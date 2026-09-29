@@ -1,0 +1,320 @@
+import { useEffect, useMemo } from "react";
+import { AlertTriangle, ChevronDown, ChevronUp, Sparkles } from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import {
+  LeverageField,
+  NumberField,
+  PriceField,
+  SectionHeader,
+  SelectField,
+  ToggleField,
+} from "@/components/executor/fields";
+import { ORDER_TYPE_OPTIONS } from "@/components/executor/field-options";
+import { autoFillGridPrices, gridConfigErrors, gridPriceFieldValid } from "@/lib/gridExecutor";
+import type { GridState, GridAction } from "@/lib/gridExecutor";
+
+interface GridConfigPanelProps {
+  state: GridState;
+  dispatch: React.Dispatch<GridAction>;
+  currentPrice: number | null;
+  isSpot?: boolean;
+  quoteCurrency?: string;
+}
+
+export function GridConfigPanel({ state, dispatch, currentPrice, isSpot = false, quoteCurrency = "USDT" }: GridConfigPanelProps) {
+  const { i18n } = useTranslation();
+  const isChinese = i18n.language === "zh-CN";
+  const validation = useMemo(() => {
+    const errors = gridConfigErrors(state);
+    const warnings: string[] = [];
+
+    // Compute estimated levels (mirrors _generate_grid_levels logic)
+    let levels = 0;
+    let levelConstraint: "spread" | "amount" | null = null;
+    if (state.start_price > 0 && state.end_price > 0 && state.start_price < state.end_price) {
+      const range = (state.end_price - state.start_price) / state.start_price;
+      const levelsBySpread = state.min_spread_between_orders > 0
+        ? Math.floor(range / state.min_spread_between_orders)
+        : Infinity;
+      const levelsByAmount = state.min_order_amount_quote > 0
+        ? Math.floor(state.total_amount_quote / state.min_order_amount_quote)
+        : Infinity;
+
+      if (levelsBySpread !== Infinity || levelsByAmount !== Infinity) {
+        levels = Math.min(levelsBySpread, levelsByAmount);
+        levels = Math.max(1, levels);
+        levelConstraint = levelsByAmount < levelsBySpread ? "amount" : "spread";
+      }
+    }
+
+    if (levels > 0 && levels < 3) {
+      warnings.push("Fewer than 3 grid levels");
+    }
+
+    return { errors, warnings, levels, levelConstraint, valid: errors.length === 0 };
+  }, [state]);
+
+  const handleAutoFill = () => {
+    const filled = autoFillGridPrices(state.side, currentPrice ?? 0);
+    if (!filled) return;
+    for (const [field, value] of Object.entries(filled)) {
+      dispatch({ type: "SET_FIELD", field, value });
+    }
+  };
+
+  // Draw the range around this market's price once, so the panel opens with its
+  // three lines already on the chart and ready to be dragged. Spent per market,
+  // so a range the user cleared or is mid-way through typing stays theirs.
+  useEffect(() => {
+    if (currentPrice && currentPrice > 0 && !state.anchored) {
+      dispatch({ type: "ANCHOR", price: currentPrice });
+    }
+  }, [currentPrice, state.anchored, dispatch]);
+
+  const perLevel = validation.levels > 0 ? state.total_amount_quote / validation.levels : 0;
+  const totalRange = state.start_price > 0 && state.end_price > 0 && state.start_price < state.end_price
+    ? ((state.end_price - state.start_price) / state.start_price) * 100
+    : 0;
+
+  return (
+    <div className="flex flex-col gap-4 overflow-y-auto p-3">
+      {/* ── Direction ── */}
+      <div>
+        <SectionHeader>Direction</SectionHeader>
+        <div className="mt-1.5 flex gap-1">
+          <button
+            onClick={() => dispatch({ type: "SET_FIELD", field: "side", value: 1 })}
+            className={`flex-1 rounded py-2 text-xs font-bold transition-colors ${
+              state.side === 1
+                ? "bg-[var(--color-green)] text-white"
+                : "bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)]"
+            }`}
+          >
+            LONG
+          </button>
+          <button
+            onClick={() => dispatch({ type: "SET_FIELD", field: "side", value: 2 })}
+            className={`flex-1 rounded py-2 text-xs font-bold transition-colors ${
+              state.side === 2
+                ? "bg-[var(--color-red)] text-white"
+                : "bg-[var(--color-surface)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)]"
+            }`}
+          >
+            SHORT
+          </button>
+        </div>
+      </div>
+
+      {/* ── Prices ── */}
+      <div className="space-y-2.5">
+        <div className="flex items-center justify-between">
+          <SectionHeader>Prices</SectionHeader>
+          <button
+            onClick={handleAutoFill}
+            disabled={!currentPrice}
+            className="flex items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-[10px] text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-hover)] disabled:opacity-40"
+            title="Auto-fill from current price"
+          >
+            <Sparkles className="h-3 w-3" />
+            Auto-fill
+          </button>
+        </div>
+
+        <PriceField
+          label="Lower Price (grid start)"
+          value={state.start_price}
+          field="start_price"
+          activePickField={state.activePickField}
+          dispatch={dispatch}
+          valid={gridPriceFieldValid("start", state)}
+        />
+        <PriceField
+          label="Upper Price (grid end)"
+          value={state.end_price}
+          field="end_price"
+          activePickField={state.activePickField}
+          dispatch={dispatch}
+          valid={gridPriceFieldValid("end", state)}
+        />
+        <PriceField
+          label={`${state.side === 1 ? "Lower" : "Upper"} Limit (stop-loss)`}
+          value={state.limit_price}
+          field="limit_price"
+          activePickField={state.activePickField}
+          dispatch={dispatch}
+          valid={gridPriceFieldValid("limit", state)}
+          hint={state.side === 1 ? "Must be below the lower price" : "Must be above the upper price"}
+        />
+      </div>
+
+      {/* ── Grid Structure ── */}
+      <div className="space-y-2.5">
+        <SectionHeader>Grid Structure</SectionHeader>
+        <NumberField
+          label={`Total Amount (${quoteCurrency})`}
+          value={state.total_amount_quote}
+          field="total_amount_quote"
+          dispatch={dispatch}
+          step={10}
+          min={0}
+          suffix={quoteCurrency}
+        />
+        <NumberField
+          label={`Min Order Amount (${quoteCurrency})`}
+          value={state.min_order_amount_quote}
+          field="min_order_amount_quote"
+          dispatch={dispatch}
+          step={1}
+          min={0}
+          suffix={quoteCurrency}
+        />
+        <NumberField
+          label="Min Spread Between Orders"
+          value={state.min_spread_between_orders}
+          field="min_spread_between_orders"
+          dispatch={dispatch}
+          step={0.01}
+          isPercent
+          suffix="%"
+        />
+        {(validation.levels > 0 || totalRange > 0) && (
+          <div className="space-y-1 rounded bg-[var(--color-bg)] px-2.5 py-1.5 text-[10px] text-[var(--color-text-muted)]">
+            {totalRange > 0 && (
+              <p>Range: {totalRange.toFixed(2)}%</p>
+            )}
+            {validation.levels > 0 && (
+              <>
+                <p>
+                  {isChinese
+                    ? `约 ${validation.levels} 档 · 每档约 $${perLevel.toFixed(2)}`
+                    : `~${validation.levels} levels · ~$${perLevel.toFixed(2)}/level`}
+                  {validation.levelConstraint === "amount" && (
+                    <span className="ml-1 text-amber-400">{isChinese ? "（受总金额限制）" : "(limited by amount)"}</span>
+                  )}
+                  {validation.levelConstraint === "spread" && (
+                    <span className="ml-1 text-[var(--color-text-muted)]">{isChinese ? "（受最小间距限制）" : "(limited by spread)"}</span>
+                  )}
+                </p>
+                {validation.levels > 1 && (
+                  <p>{isChinese ? "网格步长" : "Step"}: {(totalRange / (validation.levels - 1)).toFixed(3)}%</p>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        <LeverageField value={state.leverage} field="leverage" dispatch={dispatch} isSpot={isSpot} />
+      </div>
+
+      {/* ── Take Profit ── */}
+      <div className="space-y-2.5">
+        <SectionHeader>Take Profit</SectionHeader>
+        <NumberField
+          label="Take Profit"
+          value={state.take_profit}
+          field="take_profit"
+          dispatch={dispatch}
+          step={0.01}
+          isPercent
+          suffix="%"
+        />
+        <ToggleField
+          label="Keep Position"
+          value={state.keep_position}
+          field="keep_position"
+          dispatch={dispatch}
+        />
+        <ToggleField
+          label="Coerce TP to Step"
+          value={state.coerce_tp_to_step}
+          field="coerce_tp_to_step"
+          dispatch={dispatch}
+        />
+      </div>
+
+      {/* ── Advanced (collapsible) ── */}
+      <div>
+        <button
+          onClick={() => dispatch({ type: "SET_FIELD", field: "showAdvanced", value: !state.showAdvanced })}
+          className="flex w-full items-center justify-between rounded px-1 py-1.5 text-xs font-medium uppercase tracking-wider text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+        >
+          Advanced
+          {state.showAdvanced ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </button>
+
+        {state.showAdvanced && (
+          <div className="mt-2 space-y-2.5">
+            <div className="grid grid-cols-2 gap-2">
+              <NumberField
+                label="Max Open Orders"
+                value={state.max_open_orders}
+                field="max_open_orders"
+                dispatch={dispatch}
+                step={1}
+                min={1}
+              />
+              <NumberField
+                label="Max Orders/Batch"
+                value={state.max_orders_per_batch}
+                field="max_orders_per_batch"
+                dispatch={dispatch}
+                step={1}
+                min={1}
+              />
+            </div>
+            <NumberField
+              label="Order Frequency"
+              value={state.order_frequency}
+              field="order_frequency"
+              dispatch={dispatch}
+              step={1}
+              min={1}
+              suffix="s"
+            />
+            <NumberField
+              label="Activation Bounds"
+              value={state.activation_bounds}
+              field="activation_bounds"
+              dispatch={dispatch}
+              step={0.01}
+              isPercent
+              suffix="%"
+            />
+            <SelectField
+              label="Open Order Type"
+              value={state.open_order_type}
+              field="open_order_type"
+              dispatch={dispatch}
+              options={ORDER_TYPE_OPTIONS}
+            />
+            <SelectField
+              label="Take Profit Order Type"
+              value={state.take_profit_order_type}
+              field="take_profit_order_type"
+              dispatch={dispatch}
+              options={ORDER_TYPE_OPTIONS}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* ── Validation ── */}
+      {(validation.errors.length > 0 || validation.warnings.length > 0) && (
+        <div className="space-y-1">
+          {validation.errors.map((err, i) => (
+            <p key={i} className="flex items-center gap-1 text-[10px] text-[var(--color-red)]">
+              <AlertTriangle className="h-3 w-3 shrink-0" />
+              {err}
+            </p>
+          ))}
+          {validation.warnings.map((warn, i) => (
+            <p key={i} className="flex items-center gap-1 text-[10px] text-amber-400">
+              <AlertTriangle className="h-3 w-3 shrink-0" />
+              {warn}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

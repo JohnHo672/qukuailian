@@ -1,0 +1,58 @@
+name: Feature Request
+description: Suggest something Condor should be able to do
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea.
+
+        **Before you file:** search the [open issues](https://github.com/hummingbot/condor/issues?q=is%3Aissue) — someone may already be arguing for it, and a second voice on one thread carries further than a second thread.
+
+        If you already know what the change looks like in code, a pull request is welcome instead.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Condor would this touch? (The dashboard preselects this for you.)
+      options:
+        - Agents & chat
+        - Portfolio
+        - Bots & controllers
+        - Trading & executors
+        - Routines & reports
+        - Settings & connections
+        - Dashboard (other)
+        - Telegram bot
+        - Gateway / DEX
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-suggestion
+    attributes:
+      label: What should it do
+      description: Describe the behavior you want, not the implementation.
+      placeholder: Let me filter the executors table by connector, the way the bots table already filters by status.
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-impact
+    attributes:
+      label: Why it matters
+      description: What this would let you do that you cannot do today, and how often you hit it.
+      placeholder: With 40 executors open I scroll past everything to find the two on Hyperliquid.
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-additional-context
+    attributes:
+      label: Additional context
+      description: Mockups, links, the workaround you use today, or the version you are on.
+    validations:
+      required: false

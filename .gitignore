@@ -1,0 +1,35 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python caches and virtual environments
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+
+# Node build and dependency output
+**/node_modules/
+**/dist/
+**/build/
+**/coverage/
+
+# Runtime data, logs, databases and private keys
+**/*.log
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/*.dump
+**/*.pem
+**/*.key
+**/backups/
+**/DockerDesktopDisk/
+**/WSL/
+

@@ -1,0 +1,2242 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+
+import { useServer } from "@/hooks/useServer";
+import {
+  api,
+  type AppNotification,
+  type ConversationTurn,
+  type NotificationsResponse,
+  type TokenUsage,
+} from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import { addUsage } from "@/lib/usage";
+import { namesATool, toolCallState } from "@/lib/formatters";
+import { collectViewFacts, renderViewBlock } from "@/lib/viewFacts";
+import { WS_AUTH_SUBPROTOCOL } from "@/lib/websocket";
+
+export interface ToolCall {
+  tool_call_id: string;
+  title: string;
+  status: string;
+}
+
+/**
+ * One step of a turn's run, in the order it happened (ARCH-330).
+ *
+ * A tool step carries the call's *id*, not the call: the call itself lives in
+ * `ChatMessage.toolCalls` and keeps being patched there by `tool_call_update`,
+ * so a copy here would be a second, stale answer to "what is that tool doing".
+ * The renderer joins the two.
+ */
+export type RunStep =
+  | { type: "thought"; text: string }
+  | { type: "tool"; id: string };
+
+/**
+ * Extend the run's trailing reasoning step, or open a new one.
+ *
+ * The counterpart of `Recorder._note_thought` in
+ * condor/runtime/conversations.py, and it has to merge on the same rule: a
+ * step per streamed chunk would say nothing about order, and only a tool call
+ * landing between two stretches of reasoning starts a new one. Because the
+ * flush that commits buffered text runs before any tool step is appended, a
+ * reasoning run split across several 50ms windows still lands as one step —
+ * so a turn watched live ends up with the same steps as the same turn reloaded
+ * from disk.
+ */
+function appendThoughtStep(steps: RunStep[] | undefined, text: string): RunStep[] {
+  const current = steps ?? [];
+  if (!text) return current;
+  const last = current[current.length - 1];
+  if (last && last.type === "thought") {
+    return [...current.slice(0, -1), { type: "thought", text: last.text + text }];
+  }
+  return [...current, { type: "thought", text }];
+}
+
+/** What each key shape means, said once per conversation (FEAT-056).
+ *
+ * The two `redacted` kinds describe text the user can see is gone. The other
+ * two describe text that is still there on purpose: a 64-byte value is a
+ * transaction hash or signature far more often than a key here, and redacting
+ * those by default would break "check this tx" on every use. */
+const SECRET_NOTICES: Record<string, string> = {
+  mnemonic:
+    "**A recovery phrase was removed from that message.** It never reached the " +
+    "model and was not written to the transcript. Import wallets from Settings " +
+    "instead — that flow is the only one that should ever see a key. If the " +
+    "phrase holds funds, move them.",
+  "solana-keypair":
+    "**A keypair array was removed from that message.** It never reached the " +
+    "model and was not written to the transcript. Import wallets from Settings " +
+    "instead. If that key holds funds, move them.",
+  "evm-hex64":
+    "That message carried a `0x` value 64 hex digits long. An EVM private key " +
+    "looks exactly like that — and so does a transaction hash, which is why it " +
+    "was passed through untouched. If it was a key, treat it as exposed: it " +
+    "reached the model and the transcript.",
+  "solana-b58-64":
+    "That message carried an 87–88 character base58 value. A Solana secret key " +
+    "looks exactly like that — and so does a transaction signature, which is " +
+    "why it was passed through untouched. If it was a key, treat it as " +
+    "exposed: it reached the model and the transcript.",
+};
+
+export interface ChatMessage {
+  id: string;
+  /** A `system` message is not a bubble — it is a divider in the scrollback. */
+  role: "user" | "assistant" | "system";
+  text: string;
+  toolCalls: ToolCall[];
+  thought?: string;
+  /**
+   * How the reasoning and the tool calls interleaved (ARCH-330).
+   *
+   * `thought` and `toolCalls` say *what* the run held; this says in what
+   * order, which neither of them can — a turn that thinks, calls, thinks again
+   * and calls a second time is one merged string beside a flat list there.
+   * Both are still carried, so nothing that only knows them changes.
+   *
+   * Absent means the order is not known: a turn hydrated from a transcript
+   * written before the recorder kept it. The renderer falls back to what it
+   * always drew — the reasoning, then the calls.
+   */
+  events?: RunStep[];
+  /** System: "switch" | "error" | "delegation" | "resume" | "notification" |
+   * "routine" | "secret_notice". */
+  kind?: string;
+  /**
+   * The user redirected the agent while this answer was being written. The
+   * partial stays on screen — its context survives into the next turn, so
+   * nothing is actually lost — but it is marked so it does not read as a
+   * complete answer that simply stopped making sense.
+   */
+  interrupted?: boolean;
+  /**
+   * This bubble is the one the current turn is still being written into.
+   *
+   * The flag lives in the transcript rather than in a ref beside it because
+   * *every* decision about where a fragment goes is then made from the state
+   * the fragment is folded into, inside the same updater. A pointer held
+   * outside React had to be written when the updater ran and read when the
+   * caller ran — two different moments — and any gap between them (a commit
+   * that had not happened yet, an updater React re-ran) split one answer
+   * across several bubbles.
+   */
+  open?: boolean;
+  /**
+   * When the turn was said, in epoch seconds — the same unit and clock the
+   * stored transcript uses (`TurnEntry.ts`), so a hydrated message and a live
+   * one are formatted by the same code. Absent only for a transcript recorded
+   * before this was carried.
+   */
+  ts?: number;
+  /**
+   * Who produced this turn, as the backend stamps it — three states:
+   * `undefined` is unattributed (a user line, a divider, or an assistant turn
+   * recorded before attribution existed), `""` is the default agent, Condor,
+   * and a slug is a bound Agent.
+   *
+   * Carried per turn rather than read off the conversation's binding because
+   * the binding is last-write-wins: after a handover it names the agent that
+   * took *over*, so every earlier answer was being credited to it.
+   */
+  agentSlug?: string;
+  /**
+   * What was handed over with this turn (FEAT-098).
+   *
+   * Two provenances, one shape: a bubble the composer just appended carries
+   * local object URLs (`local: true`), because the browser already has the bytes
+   * it read from the clipboard; a bubble hydrated from the transcript carries
+   * the bearer-guarded route, which `useAuthedImage` fetches. The distinction
+   * is on the item rather than on the message so the two can never be confused
+   * for one another by a renderer that only sees a URL.
+   */
+  attachments?: ChatAttachment[];
+}
+
+/** One picture on a turn, as the transcript renders it. */
+export interface ChatAttachment {
+  url: string;
+  mime: string;
+  /** The URL is already an object URL for bytes in this tab; do not fetch it. */
+  local?: boolean;
+}
+
+/**
+ * The backend's name for one web chat session: `web:{user}:{slot}`.
+ *
+ * `SlotInfo` deliberately does not carry it — the slot id is what the socket
+ * addresses — but anything that hands work to the backend *as this
+ * conversation* (a routine run launched from the dock, a brain switch) has to
+ * spell it the way `SessionKey.parse` reads it. One place, so it stays spelled
+ * the same in all of them.
+ */
+export function webSessionKey(userId: number | string, slotId: string): string {
+  return `web:${userId}:${slotId}`;
+}
+
+export interface SlotInfo {
+  slot_id: string;
+  /** Durable conversation behind the slot. Same value as slot_id for web. */
+  conversation_id?: string;
+  agent_key: string;
+  is_busy?: boolean;
+  server_name?: string;
+  /**
+   * The bound Agent's front matter chose the server, so it is not the chat's
+   * to change — the chip locks instead of offering a picker that would be
+   * overruled at spawn.
+   */
+  server_pinned?: boolean;
+  /** Bound domain Agent, or "" for the plain assistant. */
+  agent_slug?: string;
+  /**
+   * Whether an agent subprocess is behind the slot right now.
+   *
+   * `false` is a slot the backend reaped — an idle detach, an eviction, a
+   * subprocess that died — and not a slot that ended: the conversation is
+   * intact, so the tab stays, its transcript still hydrates, and the first
+   * message sent into it reattaches a session on the way through (CORR-265).
+   * Absent from a backend older than that, which listed only live slots.
+   */
+  alive?: boolean;
+  /** Display name of whoever is answering. */
+  label?: string;
+  /**
+   * ISO timestamp of the last turn, or null for a session never prompted.
+   * Only the roster carries it — it is what makes a reload land on the
+   * conversation you were last in.
+   */
+  last_prompt_at?: string | null;
+}
+
+/** A tool call waiting for the user to approve or reject it. */
+export interface PermissionRequest {
+  request_id: string;
+  summary: string;
+  /** Which agent, on which server, raised it. Empty when unattributable. */
+  origin?: string;
+  /** The bare tool name, previewed like the command it is. */
+  tool?: string;
+  /** Its arguments; null when the backend could not read them. */
+  input?: Record<string, unknown> | null;
+  /**
+   * When the runtime denies it unanswered, in *this* browser's epoch seconds —
+   * derived from the server's relative `expires_in` on arrival, so a skewed
+   * local clock cannot make the countdown lie. Absent from an older backend.
+   */
+  deadline?: number;
+}
+
+/** A relative `expires_in` from the wire, as a local deadline. */
+export function deadlineFrom(expiresIn: unknown): number | undefined {
+  return typeof expiresIn === "number" ? Date.now() / 1000 + expiresIn : undefined;
+}
+
+/**
+ * Bucket for a request the backend did not stamp with a slot.
+ *
+ * Only an older server does that. Its requests are shown in whichever
+ * conversation is active — the pre-CORR-101 behaviour — so a dashboard running
+ * ahead of its backend still lets the user answer rather than silently
+ * swallowing the approval until it times out.
+ */
+const UNATTRIBUTED = "";
+
+export interface ChatSlot {
+  info: SlotInfo;
+  messages: ChatMessage[];
+  /**
+   * The tab exists but its subprocess is still spawning. The input is live
+   * anyway — anything typed is queued and flushed the moment the session
+   * lands, which is what makes a new chat feel warm instead of loading.
+   */
+  pending?: boolean;
+  /**
+   * What this conversation has cost so far (FEAT-120): seeded from the stored
+   * total on hydrate and advanced by each `prompt_done`. Absent until the
+   * backend has measured something.
+   */
+  usage?: TokenUsage;
+}
+
+let msgIdCounter = 0;
+function nextMsgId(): string {
+  return `msg_${Date.now()}_${++msgIdCounter}`;
+}
+
+/**
+ * Where the next streamed fragment goes, or -1 for "open a new bubble".
+ *
+ * The bubble being streamed into only counts while it is still the *last*
+ * message and its turn has not ended. Anything appended after it — the next
+ * question, a handover divider — ends that turn as far as the transcript is
+ * concerned, whatever the wire says. Without the position check a bubble whose
+ * `prompt_done` was missed (a WS drop mid-answer, a late chunk) keeps
+ * swallowing the next answer, and that answer renders *above* the question it
+ * answers.
+ */
+function streamTarget(msgs: ChatMessage[]): number {
+  const last = msgs.length - 1;
+  return last >= 0 && msgs[last].open ? last : -1;
+}
+
+/**
+ * Fold one fragment into the slot's open bubble, opening one if needed.
+ *
+ * A pure function of the list it is handed: the bubble a fragment continues is
+ * the one the list itself marks as open, so nothing outside React has to
+ * remember which bubble that was between two commits.
+ *
+ * `agentSlug` is stamped onto a bubble the moment it is opened, which is the
+ * only moment it is knowable: the slot's binding is right *now*, and a later
+ * handover rewrites it. Stamping at fold time is what makes a live transcript
+ * agree with the reloaded one, where the backend supplies the same field.
+ */
+function foldIntoStream(
+  msgs: ChatMessage[],
+  patch: (m: ChatMessage) => ChatMessage,
+  agentSlug?: string,
+): ChatMessage[] {
+  const out = [...msgs];
+  const idx = streamTarget(out);
+  if (idx < 0) {
+    out.push(
+      patch({
+        id: nextMsgId(),
+        role: "assistant",
+        text: "",
+        toolCalls: [],
+        open: true,
+        ts: nowTs(),
+        agentSlug,
+      }),
+    );
+  } else {
+    out[idx] = patch(out[idx]);
+  }
+  return out;
+}
+
+/**
+ * End the turn: whatever is on screen is what was said.
+ *
+ * Every open bubble is closed, not just the last one. A bubble stops being
+ * *foldable* the moment anything is appended after it, but it does not stop
+ * being open: an out-of-band note (a routine outcome pushed mid-answer) lands
+ * after a bubble the turn was still writing into, and that bubble is what
+ * `open` has to keep describing until the turn actually ends. Closing only the
+ * tail left it flagged open forever, and the next turn in the same slot lit it
+ * up as live again.
+ *
+ * Returning the same array when there is nothing to close keeps a
+ * `prompt_done` for an idle slot from re-rendering the transcript.
+ */
+function closeStream(msgs: ChatMessage[]): ChatMessage[] {
+  if (!msgs.some((m) => m.open)) return msgs;
+  return msgs.map((m) => (m.open ? { ...m, open: false } : m));
+}
+
+/** Stop every tool call that is still spinning. A prompt that ended, ended.
+ *
+ *  "Still spinning" is `toolCallState`'s answer, not "not `completed`" — and
+ *  the difference is the whole of CORR-324. A call the permission gate refused
+ *  is over: rewriting it to `completed` here told the user a tool ran that they
+ *  had said no to. It reads as terminal there, so it is left exactly as the
+ *  bridge reported it, which is also what the transcript on disk holds. */
+function settleToolCalls(msgs: ChatMessage[]): ChatMessage[] {
+  return msgs.map((m) =>
+    m.toolCalls.some((tc) => toolCallState(tc.status) === "pending")
+      ? {
+          ...m,
+          toolCalls: m.toolCalls.map((tc) =>
+            toolCallState(tc.status) === "pending"
+              ? { ...tc, status: "completed" }
+              : tc,
+          ),
+        }
+      : m,
+  );
+}
+
+/** Now, in the epoch seconds the transcript is recorded in. */
+function nowTs(): number {
+  return Date.now() / 1000;
+}
+
+/**
+ * One system entry, ready to append — a reload, a routine's note, an error, a
+ * handover divider.
+ *
+ * Every one of them is the same shape, so the shape lives here alone: callers
+ * say the words and the kind, and the id and the timestamp are minted at the
+ * moment the note is made. Anything `ChatMessage` later grows for system
+ * entries is added once, here, instead of being hunted through the file.
+ */
+function systemNote(text: string, kind?: string): ChatMessage {
+  return {
+    id: nextMsgId(),
+    role: "system",
+    text,
+    kind,
+    toolCalls: [],
+    ts: nowTs(),
+  };
+}
+
+let clientRefCounter = 0;
+/** Local handle for a tab that has no conversation id yet. Echoed by the
+ *  backend on `session_started`, which is how the two are reconciled. */
+function nextClientRef(): string {
+  return `new_${++clientRefCounter}`;
+}
+
+// ── History comes from the server ──
+//
+// This used to keep a copy of the rendered messages in localStorage. That was
+// a second truth about what was said: per-browser, keyed on a slot id that
+// died with the subprocess, and invisible to Telegram. The backend now records
+// every turn (FEAT-015), so the transcript is fetched, never mirrored.
+
+/**
+ * Did the recorded stream end early?
+ *
+ * The truth lives on disk: `TurnEntry.stop_reason` is written by the recorder
+ * precisely so a reply cut short — by a steer, an abort, a timeout, a dropped
+ * subprocess, a backend error — can be told apart from a finished one. Live,
+ * the `prompt_interrupted` frame marks the bubble; a reload had nothing, so
+ * the same partial came back reading like the agent's considered answer.
+ *
+ * `end_turn` is the only reason that means "it finished". `""` is *not* a
+ * synonym for it: it is "never reported" — the abandoned generator, and every
+ * turn written before the field existed — so it is left unmarked rather than
+ * guessed at in either direction. Everything else the backend actually said,
+ * including reasons no adapter emits yet, is an early ending.
+ */
+function endedEarly(stopReason: string | undefined): boolean {
+  return !!stopReason && stopReason !== "end_turn";
+}
+
+/**
+ * Is there anything in this turn to put on screen?
+ *
+ * The counterpart is `Recorder.flush` in condor/runtime/conversations.py: it
+ * writes an assistant turn when there is text **or** tool calls **or**
+ * reasoning, and it is the only thing that decides what reaches disk. This is
+ * the same question asked of what came back, so the two answers have to agree
+ * — and they had drifted apart on exactly the case the recorder added the
+ * `thought` clause for: a turn the user stopped, or a stream that failed,
+ * while the model was still thinking. That turn was rendered live, is on disk,
+ * and is replayed into the resumed session's context, but the client called it
+ * empty and dropped it, so the transcript silently lost a turn the user had
+ * just been reading.
+ *
+ * Attachments are this side's own clause and have no counterpart in `flush`:
+ * they hang off the *opening* turn, which is written unconditionally. A
+ * picture with no words is still the message.
+ *
+ * One predicate, so the next field added to a turn is considered once.
+ */
+function isRenderableTurn(
+  turn: ConversationTurn,
+  toolCalls: ToolCall[],
+  attachments: ChatAttachment[],
+): boolean {
+  return !!turn.text || !!turn.thought || toolCalls.length > 0 || attachments.length > 0;
+}
+
+/**
+ * The recorded run, resolved against the calls the same turn carries.
+ *
+ * A tool step names a call by id; a step naming one this turn does not hold is
+ * dropped rather than rendered as a nameless row. `undefined` — not an empty
+ * list — is the answer for a turn recorded before the order was kept, because
+ * the renderer has to be able to tell "the run was empty" from "nobody wrote
+ * the order down" and only the second one falls back to the flat fields.
+ */
+function turnToRunSteps(
+  turn: ConversationTurn,
+  toolCalls: ToolCall[],
+): RunStep[] | undefined {
+  const recorded = turn.events;
+  if (!recorded || recorded.length === 0) return undefined;
+  const known = new Set(toolCalls.map((tc) => tc.tool_call_id));
+  const steps: RunStep[] = [];
+  for (const step of recorded) {
+    if (step.type === "thought") {
+      if (step.text) steps.push({ type: "thought", text: step.text });
+    } else if (step.type === "tool") {
+      const id = String(step.id ?? "");
+      if (known.has(id)) steps.push({ type: "tool", id });
+    }
+  }
+  return steps;
+}
+
+function turnsToMessages(
+  turns: ConversationTurn[],
+  conversationId: string,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  turns.forEach((turn, i) => {
+    const toolCalls: ToolCall[] = (turn.tool_calls || []).map((tc) => ({
+      tool_call_id: String(tc.id ?? ""),
+      title: String(tc.title ?? ""),
+      status: String(tc.status ?? "completed"),
+    }));
+    // The picture is what makes the user's own bubble survive a reload: without
+    // it the model would remember the image while the bubble that sent it lost
+    // it, an asymmetry that reads as a bug.
+    const attachments: ChatAttachment[] = (turn.attachments || []).map((a) => ({
+      url: api.attachmentUrl(conversationId, a.id),
+      mime: a.mime,
+    }));
+    // A turn holding nothing at all is an artifact of a prompt that died
+    // before producing anything; rendering it as an empty bubble is noise.
+    if (!isRenderableTurn(turn, toolCalls, attachments)) return;
+    // A handover reads the same after a reload as it did live: the backend
+    // records it as a system turn, so there is one source for the divider.
+    const role =
+      turn.role === "user" ? "user" : turn.role === "system" ? "system" : "assistant";
+    messages.push({
+      id: `hist_${i}_${turn.ts}`,
+      role,
+      text: turn.text,
+      toolCalls,
+      thought: turn.thought || undefined,
+      events: turnToRunSteps(turn, toolCalls),
+      kind: turn.kind || undefined,
+      ts: turn.ts,
+      // A slug names the bound Agent. An empty slug with a model behind it is
+      // a stamped turn from the default agent, Condor — distinct from both
+      // fields being empty, which is a line written before the backend
+      // attributed turns at all and is left unattributed so the divider walk
+      // still gets to answer for it.
+      agentSlug: turn.agent_slug || (turn.agent_key ? "" : undefined),
+      // The seam the live `prompt_interrupted` frame draws, drawn again from
+      // the record — so a reload says the same thing the user watched happen.
+      // Assistant turns only: `stop_reason` describes a model stream, and a
+      // system divider has none to describe.
+      interrupted:
+        role === "assistant" && endedEarly(turn.stop_reason) ? true : undefined,
+      attachments: attachments.length ? attachments : undefined,
+    });
+  });
+  return messages;
+}
+
+/**
+ * How long streamed fragments accumulate before they are committed together.
+ *
+ * 50ms caps the chat's commit rate at 20/sec against a wire that delivers
+ * 50-200 frames/sec, and is short enough that the text still reads as arriving
+ * continuously.
+ */
+const FLUSH_INTERVAL_MS = 50;
+
+/**
+ * How long a streaming slot may go without a single frame before it is treated
+ * as out of contact (ARCH-329).
+ *
+ * Nothing else bounds the wait for `prompt_done`. If that frame is lost — the
+ * socket drops mid-answer and `onclose` does not clear `streamingSlots`, the
+ * backend dies, a bug swallows it — the slot streams forever: the composer
+ * stays locked and `RunStrip` stays expanded with its spinner turning on a turn
+ * that will never finish.
+ *
+ * The clock is calibrated against a signal the wire already carries rather than
+ * guessed. `ACPClient._stream` waits 30s on its event queue and, on every
+ * timeout, emits a `Heartbeat` instead of going quiet, so a *healthy* prompt
+ * says something at least every 30 seconds no matter how long the tool it is
+ * waiting on takes. Three consecutive missed beats is therefore silence the
+ * protocol does not produce on its own, while still leaving a slow-but-alive
+ * run an enormous margin — the point being that a long tool call must never
+ * trip this. A watchdog that turns a working run into a false failure would be
+ * worse than the bug it fixes.
+ *
+ * The margin is real but not absolute: `PydanticAIClient` emits its heartbeat
+ * at model-request boundaries rather than on a timer, so a single very long
+ * tool call there can outlast this. That is precisely why expiry is
+ * recoverable — see `stalledSlots`.
+ */
+const STALL_TIMEOUT_MS = 90_000;
+
+/**
+ * How often the stall sweep looks. Coarse on purpose: it decides nothing on its
+ * own — `STALL_TIMEOUT_MS` measured against the last frame does — so this only
+ * sets how promptly the verdict is noticed, and a slow tick keeps an idle chat
+ * from waking React every second.
+ */
+const STALL_SWEEP_MS = 5_000;
+
+/**
+ * The bell's cache key (FEAT-048).
+ *
+ * Lives here because this is where the live `notification` event is written
+ * into it; `NotificationBell` reads the same key, so a pushed notice and a
+ * fetched one are one list. Not server-scoped: notifications belong to the
+ * user, not to whichever trading server is selected.
+ */
+export const NOTIFICATIONS_KEY = ["notifications"] as const;
+
+export function useChatSocket() {
+  const { token, user } = useAuth();
+  const queryClient = useQueryClient();
+  // Which trading server a prewarmed chat is born on. Read through a ref
+  // rather than a dependency: the selection changes while the socket lives,
+  // and rebuilding every callback that transitively reaches it would tear the
+  // connection down with them. Seeded from localStorage on the first render,
+  // so it is already right when the prewarm fires.
+  const { server } = useServer();
+  const serverRef = useRef(server);
+  useEffect(() => {
+    serverRef.current = server;
+  }, [server]);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  // Whether this hook still wants a socket. `close()` is asynchronous, so the
+  // cleanup that cancels the pending retry cannot also stop the `onclose` that
+  // is about to fire: without this flag that handler re-arms the very reconnect
+  // we just cancelled, and an unmounted hook keeps rebuilding a socket — with
+  // the logged-out session's JWT — every few seconds for the life of the tab.
+  const shouldConnect = useRef(false);
+  // JWT the live socket was opened with, so a token change rebinds instead of
+  // riding on a connection authenticated as the previous session.
+  const socketToken = useRef<string | null>(null);
+  // Backoff for the retry, same shape as `CondorWebSocket`: a server that is
+  // down must not be hammered once per interval by every open tab.
+  const reconnectDelay = useRef(1000);
+  const MAX_RECONNECT_DELAY = 30000;
+  // Which bubble a slot is streaming into is not tracked here: it is the
+  // `open` message in the slot's own transcript. See `foldIntoStream`.
+  // Conversations already fetched, so an ordinary roster refresh doesn't
+  // re-hydrate a slot and clobber what is on screen.
+  const hydratedSlots = useRef<Set<string>>(new Set());
+  // Has this hook ever had a socket up? The second and every later `onopen` is
+  // a *re*-connect, which is the one event that means "the wire may have
+  // skipped a push" — a delegation's completion note, a routine's result. Those
+  // are broadcast once and never replayed, so the transcript is their only
+  // record. See `needsResync`.
+  const hasConnected = useRef(false);
+  // Set by a reconnect, consumed by the `sessions_list` that follows it: the
+  // roster the server sends on connect is where the re-read is issued, one GET
+  // per listed conversation. A `list_sessions` the client asked for itself does
+  // not set this, so a roster refresh stays free.
+  const needsResync = useRef(false);
+  // Text typed into a tab whose spawn is still in flight. Keyed by the tab's
+  // id (a client_ref for a new chat, the conversation id for a resume) and
+  // flushed on session_started — that queue IS the warm session. Each entry
+  // carries the page context captured at *queue* time, not at flush time: the
+  // block is true of the moment the user asked, and a spawn can land after
+  // they have navigated away.
+  //
+  // Attachments ride along as the browser's own `File`s and are uploaded at
+  // flush, not at queue time (FEAT-098). That is what makes the hero composer
+  // work without a staging area: the POST writes *inside* the conversation
+  // directory, and the conversation directory is created by the spawn this
+  // queue is waiting for.
+  const outbox = useRef<
+    Record<string, { text: string; view: string; files?: File[] }[]>
+  >({});
+  // A tab opened optimistically is renamed on session_started: the client_ref
+  // it was started under becomes the backend's slot id. The workspace follows
+  // the rename through `activeSlotId`, which this hook rewrites itself — but a
+  // surface that keeps its own slot id (the bubble holds one per bound agent,
+  // FEAT-059) would be left pointing at a ref no slot answers to, and its next
+  // send would respawn. This map is how such a caller follows the rename.
+  const refAliases = useRef<Record<string, string>>({});
+  // Refs started with `focus: false`, so their session_started must not adopt
+  // the slot as active even when nothing else is — the workspace would open on
+  // a conversation the user never chose there.
+  const unfocusedRefs = useRef<Set<string>>(new Set());
+  // The dashboard prewarms the most recent conversation once per mount, never
+  // per reconnect: the 3s retry loop would otherwise spawn on every failure.
+  const prewarmed = useRef(false);
+  // Prewarming is the chat workspace's privilege, not a side effect of holding
+  // the socket open. `prewarmDeferred` is the one prewarm an empty roster asked
+  // for while nobody was allowed to grant it, kept so opening the workspace
+  // later is still warm.
+  const prewarmAllowed = useRef(false);
+  const prewarmDeferred = useRef(false);
+
+  const [isConnected, setIsConnected] = useState(false);
+  const [slots, setSlots] = useState<ChatSlot[]>([]);
+  // Mirror of the latest committed `slots` so event handlers can read the
+  // current list synchronously without closing over stale state.
+  const slotsRef = useRef<ChatSlot[]>([]);
+  const [activeSlotId, setActiveSlotId] = useState<string | null>(null);
+  // Which conversations are mid-answer, keyed by slot like every other per-slot
+  // piece of state here. The socket multiplexes concurrent prompts across every
+  // open tab, so as a single scalar this was cross-talk: whichever slot finished
+  // first cleared it for all of them, stopping the other tabs' spinners and
+  // re-enabling their composer and brain picker underneath a live prompt.
+  const [streamingSlots, setStreamingSlots] = useState<Record<string, true>>({});
+  /**
+   * Conversations that were streaming and have gone silent (ARCH-329).
+   *
+   * Held *beside* `streamingSlots` rather than removed from it, because the two
+   * say different things and only one of them is known: `streamingSlots` is the
+   * fact that a turn started and no frame has ended it, which stays true; this
+   * is a suspicion about a wire, which the next frame can withdraw. Keeping the
+   * turn on the books is what makes recovery free — a slot that speaks again is
+   * streaming once more, with nothing to rebuild, because nothing was torn down.
+   *
+   * Nothing is written into the transcript when this is set, and that is the
+   * point. The honest render of a turn whose end was lost is the one a reload
+   * produces, and a reload finds exactly what is on screen now: the text that
+   * arrived, and a tool call still marked in-flight because it never reported
+   * otherwise. Settling those calls here — or marking the bubble `interrupted`,
+   * which means the *user* redirected the agent — would invent an ending the
+   * transcript does not have and put the live view back out of step with the
+   * reloaded one, which is the disagreement CORR-323, CORR-325 and CORR-327
+   * were each filed to close.
+   */
+  const [stalledSlots, setStalledSlots] = useState<Record<string, true>>({});
+  /** When each slot last had *any* frame addressed to it. Epoch ms. */
+  const lastFrameAt = useRef<Record<string, number>>({});
+  // Conversations whose turn has been accepted but has not started — it is
+  // waiting behind the one in front of it. Keyed by slot like everything else
+  // here, and short-lived: the first fragment of the answer clears it.
+  const [queuedSlots, setQueuedSlots] = useState<Record<string, true>>({});
+  // Keyed by the conversation that raised it, like every other per-slot piece
+  // of state here. As a single scalar this was both misattributed — the banner
+  // rendered in whatever tab was open — and lossy: a second confirmation
+  // overwrote the first, which then went unanswered until its TTL denied it.
+  const [permissionRequests, setPermissionRequests] = useState<
+    Record<string, PermissionRequest>
+  >({});
+
+  /**
+   * Replace one conversation's transcript. The only place that knows how.
+   *
+   * Every messages-only update in this file goes through here, which is what
+   * makes "which slot does this event belong to" a single decision rather than
+   * one repeated at each call site: a field added to a system entry, or a
+   * change to how a slot is matched (following `refAliases`, say), is applied
+   * once instead of being hunted for in a dozen near-identical `map`s.
+   *
+   * The updater is handed the slot as well as its messages, so a transcript
+   * that needs a fact about its conversation — the agent a bubble is stamped
+   * with — can read it without reaching back into `slots`. Updates that also
+   * touch `info` or `pending` are *not* messages-only and stay written out.
+   */
+  const updateSlotMessages = useCallback(
+    (
+      slotId: string,
+      updater: (msgs: ChatMessage[], slot: ChatSlot) => ChatMessage[],
+    ) => {
+      setSlots((prev) =>
+        prev.map((s) =>
+          s.info.slot_id === slotId
+            ? { ...s, messages: updater(s.messages, s) }
+            : s,
+        ),
+      );
+    },
+    [],
+  );
+
+  /**
+   * Append one system divider — a reload, a routine's note, a secret notice.
+   *
+   * They differ only in their words and their kind, so that is all a caller
+   * says. The id and the timestamp are minted here, at the moment the note
+   * actually joins the transcript.
+   */
+  const appendSystemNote = useCallback(
+    (slotId: string, text: string, kind?: string) => {
+      updateSlotMessages(slotId, (msgs) => [...msgs, systemNote(text, kind)]);
+    },
+    [updateSlotMessages],
+  );
+
+  // A slot is streaming from its first fragment until its prompt ends. Both
+  // helpers return the previous object when nothing changes: chunks arrive
+  // rapid-fire, and a fresh object per chunk would re-render every consumer.
+  const clearQueued = useCallback((slotId: string) => {
+    setQueuedSlots((prev) => {
+      if (!(slotId in prev)) return prev;
+      const next = { ...prev };
+      delete next[slotId];
+      return next;
+    });
+  }, []);
+
+  /**
+   * This conversation just said something. Restart its clock (ARCH-329).
+   *
+   * Called for *every* frame that names a slot, whatever it carries — a token,
+   * a tool update, a heartbeat. That breadth is the whole safety argument: the
+   * watchdog below measures silence, not slowness, so anything at all arriving
+   * for a slot proves contact and buys another full timeout. A tool call that
+   * runs for ten minutes is not silence — the backend heartbeats through it —
+   * and so cannot trip it.
+   *
+   * Clearing the stall here is also what makes expiry recoverable rather than
+   * terminal: a slot written off as out of contact is reinstated by the very
+   * next frame, and since the turn was never closed there is nothing to undo.
+   */
+  const noteFrame = useCallback((slotId: string) => {
+    lastFrameAt.current[slotId] = Date.now();
+    setStalledSlots((prev) => {
+      if (!(slotId in prev)) return prev;
+      const next = { ...prev };
+      delete next[slotId];
+      return next;
+    });
+  }, []);
+
+  const startStreaming = useCallback(
+    (slotId: string) => {
+      setStreamingSlots((prev) => (prev[slotId] ? prev : { ...prev, [slotId]: true }));
+      // The turn starts on the clock: without this a slot whose very first
+      // frame was also its last would be measured from an epoch it never had.
+      noteFrame(slotId);
+      // The wait is over the moment the answer starts arriving.
+      clearQueued(slotId);
+    },
+    [clearQueued, noteFrame],
+  );
+
+  /** End streaming for *one* conversation. Never for the others. */
+  const stopStreaming = useCallback(
+    (slotId: string) => {
+      setStreamingSlots((prev) => {
+        if (!(slotId in prev)) return prev;
+        const next = { ...prev };
+        delete next[slotId];
+        return next;
+      });
+      // A turn that has properly ended cannot be out of contact: the frame that
+      // ended it is the contact. Left behind, the flag would still be sitting
+      // there when the slot's *next* turn began.
+      setStalledSlots((prev) => {
+        if (!(slotId in prev)) return prev;
+        const next = { ...prev };
+        delete next[slotId];
+        return next;
+      });
+      delete lastFrameAt.current[slotId];
+      clearQueued(slotId);
+    },
+    [clearQueued],
+  );
+
+  /**
+   * The watchdog: notice a streaming conversation that has stopped speaking.
+   *
+   * Nothing else bounds the wait for `prompt_done`, and every existing recovery
+   * from a lost one is something the *user* has to do — send another message,
+   * press Stop. Until they do, `isSlotStreaming` keeps answering yes, so the
+   * composer keeps its Stop button, the brain picker stays disabled and the run
+   * strip stays expanded with its spinner turning on a turn that ended long ago.
+   * A socket that drops mid-answer reaches this state on its own: `onclose`
+   * reconnects but never clears `streamingSlots`.
+   *
+   * One interval for the hook rather than a timer per slot: recording a frame
+   * then costs a ref write instead of tearing down and rearming a timeout on
+   * every token, and the sweep compares timestamps, so its own coarseness
+   * cannot shorten anyone's timeout — only delay the verdict by a tick.
+   *
+   * It runs only while something is streaming, which is also what stops it: the
+   * effect re-subscribes when `streamingSlots` changes identity, and the setters
+   * above return the previous object whenever nothing did.
+   */
+  useEffect(() => {
+    const ids = Object.keys(streamingSlots);
+    if (ids.length === 0) return;
+    const sweep = setInterval(() => {
+      const cutoff = Date.now() - STALL_TIMEOUT_MS;
+      setStalledSlots((prev) => {
+        let next: Record<string, true> | null = null;
+        for (const id of ids) {
+          if (id in prev) continue;
+          const last = lastFrameAt.current[id];
+          // No stamp at all is not silence — it is a slot whose clock never
+          // started — and writing it off would be a guess.
+          if (last === undefined || last > cutoff) continue;
+          next = next || { ...prev };
+          next[id] = true;
+        }
+        return next || prev;
+      });
+    }, STALL_SWEEP_MS);
+    return () => clearInterval(sweep);
+  }, [streamingSlots]);
+
+  // ── Streamed fragments are coalesced, not committed one per frame ──
+  //
+  // ACP emits one WS frame per model chunk, so an answer arrives at 50-200
+  // frames/sec. Committing each one re-runs remark over the *entire*
+  // accumulated bubble — one answer of length n costing O(n²) of parse work —
+  // and re-renders every consumer of the chat context at that same rate. Text
+  // and thought fragments accumulate here instead, keyed by slot, and land in
+  // a single `setSlots` per window: the buffer-in-a-ref idiom `unsent` and
+  // `outbox` already use in this file.
+  //
+  // Keyed by slot rather than kept as one buffer because the socket
+  // multiplexes concurrent prompts across every open tab; a shared buffer
+  // would file one conversation's tokens into another's bubble.
+  const pendingChunks = useRef<Record<string, { text: string; thought: string }>>(
+    {},
+  );
+  const flushTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  /**
+   * Commit every buffered fragment, for every slot, in one pass.
+   *
+   * Safe to call at any point: it no-ops on an empty buffer and cancels the
+   * open window, so the next fragment starts a fresh one. Every path that ends
+   * a turn or appends anything else to a transcript calls it *first* —
+   * buffered text has to reach its bubble before a user message, an error or a
+   * handover divider takes over as the last message, or the fold would file it
+   * into a new bubble sitting below them.
+   *
+   * `endedSlot` closes that slot's turn in the same updater that lands its
+   * tail, and that ordering is the whole point: the tail belongs to the answer
+   * above it, and the next answer must not continue the bubble it landed in.
+   * Both facts are decided from the transcript being written, so no window
+   * exists in which a fragment can be filed against a bubble that no longer
+   * is — or is not yet — the open one.
+   */
+  const flushChunks = useCallback((endedSlot?: string) => {
+    clearTimeout(flushTimer.current);
+    flushTimer.current = undefined;
+    const pending = pendingChunks.current;
+    const hasPending = Object.keys(pending).length > 0;
+    // A turn that ends still has to be closed, even with nothing buffered.
+    if (!hasPending && !endedSlot) return;
+    // Drained before the updater runs, so a re-invoked updater (StrictMode,
+    // concurrent rendering) replays the same fragments instead of appending
+    // whatever has arrived since.
+    pendingChunks.current = {};
+    setSlots((prev) =>
+      prev.map((s) => {
+        const slot = s.info.slot_id;
+        const buf = pending[slot];
+        const ends = slot === endedSlot;
+        if (!buf && !ends) return s;
+        let messages = s.messages;
+        if (buf) {
+          messages = foldIntoStream(
+            messages,
+            (m) => ({
+              ...m,
+              text: m.text + buf.text,
+              // Left alone when nothing was buffered, so a bubble with no
+              // reasoning keeps `thought` undefined rather than gaining "".
+              thought: buf.thought ? (m.thought || "") + buf.thought : m.thought,
+              // The same reasoning, placed in the run. Buffered fragments are
+              // committed before any tool step is appended (`appendToStream`
+              // flushes first), so this lands on the correct side of every
+              // call the turn made.
+              events: buf.thought ? appendThoughtStep(m.events, buf.thought) : m.events,
+            }),
+            // "" is the default agent, not "unknown": a slot with no binding is
+            // Condor answering, and saying so is what keeps the turn out of the
+            // divider walk that would later re-credit it.
+            s.info.agent_slug ?? "",
+          );
+        }
+        if (ends) messages = closeStream(messages);
+        return messages === s.messages ? s : { ...s, messages };
+      }),
+    );
+  }, []);
+
+  /** Accumulate one streamed fragment. The commit happens on the next flush. */
+  const bufferChunk = useCallback(
+    (slotId: string, field: "text" | "thought", chunk: string) => {
+      const buf = (pendingChunks.current[slotId] ||= { text: "", thought: "" });
+      buf[field] += chunk;
+      // The live signal is deliberately *not* deferred with the text: the
+      // spinner, the locked composer and the auto-expanding thinking block all
+      // key off it and should react to the first fragment. `startStreaming`
+      // collapses to a no-op once the slot is marked, so this stays free.
+      startStreaming(slotId);
+      // Only the first fragment of a window arms the timer; the rest ride it.
+      if (flushTimer.current === undefined) {
+        // Wrapped rather than passed by reference: `setTimeout` hands its
+        // callback arguments, and a stray one would read as `endedSlot`.
+        flushTimer.current = setTimeout(() => flushChunks(), FLUSH_INTERVAL_MS);
+      }
+    },
+    [flushChunks, startStreaming],
+  );
+
+  /**
+   * Fold one streamed *event* into the slot's open bubble, immediately.
+   *
+   * The low-frequency half of the stream — a tool call is not what makes the
+   * transcript expensive, and deferring it would only delay the spinner.
+   * `streamTarget` decides whether it continues the bubble in progress or
+   * opens a new one, and the slot counts as streaming from its first fragment.
+   */
+  const appendToStream = useCallback(
+    (slotId: string, patch: (m: ChatMessage) => ChatMessage) => {
+      // Whatever is buffered was received before this event and has to land
+      // before it, or the two arrive in the transcript out of order.
+      flushChunks();
+      updateSlotMessages(slotId, (msgs, s) =>
+        // "" is the default agent, not "unknown" — same rule as the flush.
+        foldIntoStream(msgs, patch, s.info.agent_slug ?? ""),
+      );
+      startStreaming(slotId);
+    },
+    [flushChunks, startStreaming, updateSlotMessages],
+  );
+
+  // Actions asked for before the socket was open. "Chat" on an agent's page
+  // opens the panel and starts a session in the same click, so the first frame
+  // routinely predates the connection. Capped, because a socket that never
+  // opens must not grow a backlog.
+  const unsent = useRef<Record<string, unknown>[]>([]);
+  const MAX_UNSENT = 20;
+
+  const send = useCallback((msg: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
+      return;
+    }
+    if (unsent.current.length < MAX_UNSENT) unsent.current.push(msg);
+  }, []);
+
+  /**
+   * Upload whatever was attached, then send the frame that names it.
+   *
+   * The order is the design (FEAT-098): a file is only ever written to disk for
+   * a message that is actually going out, so there is nothing to sweep and no
+   * retention job to own. The cost is that Send is not instantaneous for a large
+   * image — which is not felt, because the user's bubble with its thumbnail was
+   * appended optimistically before this ran, and only the agent's first token
+   * waits on the POST.
+   *
+   * A failed upload does not send a maimed frame. The turn is refused with a
+   * note the user can read, on the same argument the backend's resolution makes:
+   * an answer to the wrong question is worse than an error.
+   */
+  const uploadAndSend = useCallback(
+    async (
+      slotId: string,
+      conversationId: string,
+      text: string,
+      view: string,
+      files?: File[],
+    ) => {
+      let ids: string[] = [];
+      if (files?.length) {
+        try {
+          const stored = await Promise.all(
+            files.map((file) => api.uploadAttachment(conversationId, file)),
+          );
+          ids = stored.map((a) => a.id);
+        } catch (e) {
+          appendSystemNote(
+            slotId,
+            e instanceof Error ? e.message : "Could not attach that image",
+            "error",
+          );
+          return;
+        }
+      }
+      send({
+        action: "send_message",
+        slot_id: slotId,
+        text,
+        view_context: view,
+        ...(ids.length ? { attachments: ids } : {}),
+      });
+    },
+    [appendSystemNote, send],
+  );
+
+  /**
+   * Re-read the approvals this user has not answered yet (FEAT-010).
+   *
+   * `permission_request` is a fire-and-forget push: a reload mid-approval
+   * killed the socket it was addressed to, and nothing re-sent it, so the
+   * agent sat waiting behind a page that showed no prompt until its TTL denied
+   * the call two minutes later. The registry outlives the connection, so every
+   * socket open asks it what is still pending.
+   *
+   * Merged, never assigned: an approval this session already has on screen is
+   * left exactly as it is, and one answered between the read going out and
+   * coming back is simply absent from the reply. A failed read is silent —
+   * the socket is up and the live path still works.
+   */
+  const replayPendingConfirmations = useCallback(async () => {
+    try {
+      const pending = await api.getPendingConfirmations();
+      if (pending.length === 0) return;
+      setPermissionRequests((prev) => {
+        const next = { ...prev };
+        let added = false;
+        for (const p of pending) {
+          const slot = p.slot_id || UNATTRIBUTED;
+          if (next[slot]) continue;
+          next[slot] = {
+            request_id: p.id,
+            summary: p.summary,
+            origin: p.origin || "",
+            tool: p.tool,
+            input: p.input,
+            deadline: deadlineFrom(p.expires_in),
+          };
+          added = true;
+        }
+        return added ? next : prev;
+      });
+    } catch {
+      /* the live path is unaffected; the next connect asks again */
+    }
+  }, []);
+
+  // Drop the current socket without letting its asynchronous `onclose` speak
+  // for a connection we already decided to abandon.
+  const closeSocket = useCallback(() => {
+    clearTimeout(reconnectTimer.current);
+    const ws = wsRef.current;
+    wsRef.current = null;
+    socketToken.current = null;
+    ws?.close();
+  }, []);
+
+  const connect = useCallback(() => {
+    if (!token) return;
+    shouldConnect.current = true;
+
+    const live = wsRef.current;
+    if (
+      live &&
+      socketToken.current === token &&
+      (live.readyState === WebSocket.OPEN ||
+        live.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+    // Either the socket is gone/closing, or it carries a stale token: in both
+    // cases the old one is replaced rather than reused.
+    closeSocket();
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = import.meta.env.DEV ? "localhost:8088" : window.location.host;
+    const url = `${protocol}//${host}/api/v1/ws/chat`;
+
+    // Pass the JWT via the Sec-WebSocket-Protocol subprotocol header instead of
+    // the URL query string, so it never leaks via proxy logs or history.
+    const ws = new WebSocket(url, [WS_AUTH_SUBPROTOCOL, token]);
+    wsRef.current = ws;
+    socketToken.current = token;
+
+    ws.onopen = () => {
+      reconnectDelay.current = 1000;
+      // Anything pushed while this hook had no socket — the gap between a drop
+      // and this moment — was delivered to nobody. Ask the next roster to
+      // re-read the transcripts rather than trusting a wire that just proved
+      // it can miss frames. The first connect of a page load is exempt: its
+      // hydrate is the read.
+      needsResync.current = hasConnected.current;
+      hasConnected.current = true;
+      setIsConnected(true);
+      const queued = unsent.current;
+      unsent.current = [];
+      for (const msg of queued) ws.send(JSON.stringify(msg));
+      // The roster that follows says which conversations are alive; it says
+      // nothing about which of them is holding a tool call waiting on a click.
+      void replayPendingConfirmations();
+    };
+    ws.onclose = () => {
+      // A socket we replaced or closed on purpose still fires `onclose`, long
+      // after the hook moved on. Only the one that is currently the hook's
+      // socket may report the connection down or ask for another attempt.
+      if (wsRef.current !== ws) return;
+      setIsConnected(false);
+      if (!shouldConnect.current) return;
+      reconnectTimer.current = setTimeout(() => connect(), reconnectDelay.current);
+      reconnectDelay.current = Math.min(
+        reconnectDelay.current * 2,
+        MAX_RECONNECT_DELAY,
+      );
+    };
+    ws.onmessage = (ev) => {
+      try {
+        handleEvent(JSON.parse(ev.data));
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [token, closeSocket, replayPendingConfirmations]);
+
+  const disconnect = useCallback(() => {
+    shouldConnect.current = false;
+    closeSocket();
+    setIsConnected(false);
+  }, [closeSocket]);
+
+  /**
+   * Pull a slot's transcript from the server and drop it into the slot.
+   *
+   * Runs once per slot for the life of the page, *except* on a reconnect
+   * (`resync`), which is the one moment the WS has demonstrably stopped being
+   * authoritative: a `system_note` is broadcast once, with no queue and no ack,
+   * so a socket that was down when one was pushed loses it permanently. The
+   * transcript is the record it was written to, so re-reading it is the
+   * recovery path.
+   *
+   * The two modes merge differently, because they mean different things:
+   *
+   * - First hydrate — *prepend*. Everything already in the slot was typed or
+   *   streamed after the fetch was issued (the outbox a spawn flushes, a turn
+   *   that landed mid-flight), so none of it is in the transcript yet and all
+   *   of it belongs after.
+   * - Resync — *replace*. Everything on screen when the re-read was issued is
+   *   also in the transcript that comes back, so keeping it would double the
+   *   whole conversation. Only what arrived while the fetch was in flight, plus
+   *   a bubble still being streamed into (its turn is not recorded yet, and
+   *   dropping it would split the answer), survives to be appended.
+   */
+  const hydrateSlot = useCallback(
+    async (conversationId: string, slotId: string, resync = false) => {
+      if (!conversationId) return;
+      if (hydratedSlots.current.has(slotId) && !resync) return;
+      hydratedSlots.current.add(slotId);
+      // Snapshotted before the await, so "was already on screen" is judged
+      // against the moment the read was issued, not the moment it returned.
+      const superseded = resync
+        ? new Set(
+            (
+              slotsRef.current.find((s) => s.info.slot_id === slotId)?.messages ?? []
+            )
+              .filter((m) => !m.open)
+              .map((m) => m.id),
+          )
+        : null;
+      try {
+        const detail = await api.getConversation(conversationId);
+        // The stored total, not a sum of what this tab happened to see: a
+        // resync re-seeds, so a turn answered from Telegram or another tab
+        // converges here. Before the empty-transcript return below, which is
+        // about messages only.
+        const usage = addUsage(undefined, detail.meta?.usage);
+        if (usage && usage.total_tokens > 0) {
+          setSlots((prev) =>
+            prev.map((s) => (s.info.slot_id === slotId ? { ...s, usage } : s)),
+          );
+        }
+        const restored = turnsToMessages(detail.turns, conversationId);
+        // An empty transcript never wipes the screen: on a resync that would
+        // trade a missed note for a lost conversation.
+        if (restored.length === 0) return;
+        updateSlotMessages(slotId, (msgs) => {
+          const kept = superseded ? msgs.filter((m) => !superseded.has(m.id)) : msgs;
+          return [...restored, ...kept];
+        });
+      } catch {
+        // A conversation we cannot read is not worth breaking the chat over.
+        // The slot keeps whatever it had; a later reconnect tries again.
+        if (!resync) hydratedSlots.current.delete(slotId);
+      }
+    },
+    [updateSlotMessages],
+  );
+
+  /**
+   * Attach a session to a conversation, showing it immediately.
+   *
+   * The tab and its transcript appear on this frame; the subprocess spawns
+   * behind them. Already attached means "just look at it" — resuming a live
+   * conversation would replace a perfectly good subprocess.
+   */
+  const resumeConversation = useCallback(
+    (
+      conversationId: string,
+      meta?: Partial<SlotInfo>,
+      opts?: {
+        /**
+         * `false` keeps `activeSlotId` where it is, the same escape hatch
+         * `startSession` carries: the bubble reattaches to an agent's newest
+         * conversation from that agent's page (CORR-257), and a background
+         * surface must not decide what the workspace at `/` is showing.
+         */
+        focus?: boolean;
+      },
+    ) => {
+      if (!conversationId) return;
+      const focus = opts?.focus !== false;
+      const existing = slotsRef.current.find(
+        (s) => s.info.slot_id === conversationId,
+      );
+      if (existing) {
+        if (focus) setActiveSlotId(conversationId);
+        return;
+      }
+
+      setSlots((prev) => [
+        ...prev,
+        {
+          info: {
+            slot_id: conversationId,
+            conversation_id: conversationId,
+            // The record's key is a log of what answered last, so for a bound
+            // conversation it is not what is about to: the server resolves the
+            // Agent's *current* model. `""` lets the picker fall back to that
+            // rather than flashing a model the resume will not use.
+            agent_key: meta?.agent_slug ? "" : meta?.agent_key || "",
+            server_name: meta?.server_name,
+            agent_slug: meta?.agent_slug,
+            label: meta?.label,
+          },
+          messages: [],
+          pending: true,
+        },
+      ]);
+      // A resume's `session_started` carries no `client_ref`, so the
+      // conversation's own id is what marks it unfocused over there.
+      if (focus) setActiveSlotId(conversationId);
+      else unfocusedRefs.current.add(conversationId);
+      // In parallel with the spawn: the transcript is readable long before the
+      // agent that will continue it is up.
+      void hydrateSlot(conversationId, conversationId);
+      send({ action: "resume_conversation", conversation_id: conversationId });
+    },
+    [hydrateSlot, send],
+  );
+
+  /**
+   * Open a brand new conversation. The tab is live before the spawn is.
+   *
+   * Returns the tab's id so the caller can talk into it on the same tick — a
+   * composer that starts the chat with its first message needs that, and
+   * `slotsRef` only catches up on the next commit, so the new slot is written
+   * there eagerly rather than left for `sendMessage` to miss.
+   */
+  const startSession = useCallback(
+    (
+      agentKey: string,
+      serverName?: string,
+      agentSlug?: string,
+      opts?: {
+        /**
+         * `false` keeps `activeSlotId` where it is: the bubble starts sessions
+         * from other pages, and stealing the focus would change which
+         * conversation the workspace at `/` shows (FEAT-059).
+         */
+        focus?: boolean;
+      },
+    ): string => {
+      const ref = nextClientRef();
+      const slot: ChatSlot = {
+        info: {
+          slot_id: ref,
+          agent_key: agentKey,
+          server_name: serverName,
+          agent_slug: agentSlug || "",
+        },
+        messages: [],
+        pending: true,
+      };
+      slotsRef.current = [...slotsRef.current, slot];
+      setSlots((prev) => [...prev, slot]);
+      if (opts?.focus === false) unfocusedRefs.current.add(ref);
+      else setActiveSlotId(ref);
+      hydratedSlots.current.add(ref);
+      prewarmed.current = true; // An explicit start is the warm session.
+      send({
+        action: "start_session",
+        agent_key: agentKey,
+        server_name: serverName,
+        agent_slug: agentSlug,
+        client_ref: ref,
+      });
+      return ref;
+    },
+    [send],
+  );
+
+  /**
+   * One spawn on arrival at the workspace, so the first message never pays for
+   * the spawn: the thread the user is most likely to continue, or — when there
+   * is nothing to continue — an empty chat waiting for its first word.
+   *
+   * Not a pool: a session's subprocess carries per-user environment, so there
+   * is no user-agnostic warm process to hand out. Prewarming on *selection* —
+   * and this, the implicit selection of "the chat you were last in" — is the
+   * same latency win without idle processes burning the session budget.
+   *
+   * Which is exactly why it is gated. The shell holds the socket open on every
+   * route so push frames arrive wherever the user is standing, and on most of
+   * those routes the roster comes back empty — prewarming there would spawn a
+   * subprocess for someone who only opened /portfolio. The empty roster is
+   * remembered instead, and `enablePrewarm` redeems it.
+   */
+  const prewarmLatest = useCallback(() => {
+    if (prewarmed.current) return;
+    if (!prewarmAllowed.current) {
+      prewarmDeferred.current = true;
+      return;
+    }
+    prewarmed.current = true;
+    api
+      .listConversations(1)
+      .then(async (list) => {
+        const latest = list[0];
+        // Re-checked after the fetch: a session may have arrived meanwhile,
+        // and prewarming on top of it would spawn a second subprocess.
+        if (slotsRef.current.length > 0) return;
+        if (latest) {
+          resumeConversation(latest.id, {
+            agent_key: latest.agent_key,
+            server_name: latest.server_name || undefined,
+            agent_slug: latest.agent_slug,
+          });
+          return;
+        }
+        // Nobody to pick up with — a first visit, or every conversation
+        // deleted. The user is here to talk anyway, so the chat they are about
+        // to write in is spawned now rather than by their first message: the
+        // same warm arrival a returning user gets, minus the transcript. It
+        // opens unbound, on the user's own default brain, which is exactly what
+        // the hero's composer would have started (`""` here would silently
+        // hand them `DEFAULT_AGENT` instead of the model they last picked).
+        // The options payload is the one every chat surface already reads, on
+        // its own react-query key, so this shares that fetch rather than
+        // adding one.
+        const options = await queryClient.fetchQuery({
+          queryKey: ["session-options"],
+          queryFn: api.getSessionOptions,
+          staleTime: Infinity,
+        });
+        if (slotsRef.current.length > 0) return;
+        startSession(options.default_agent, serverRef.current || undefined);
+      })
+      .catch(() => {
+        // The API is down, or the options never came. Either way the panel
+        // still works: the composer starts a session on its first message.
+      });
+  }, [queryClient, resumeConversation, startSession]);
+
+  /**
+   * Say that this surface is a chat.
+   *
+   * Only the workspace calls it. Everywhere else the connection exists to
+   * receive push frames — a finished delegation, a routine's notice — and a
+   * user who never asked for an agent should not be given one. Calling it also
+   * redeems the prewarm an empty roster deferred, so arriving at the workspace
+   * after the shell already connected is as warm as opening it cold.
+   */
+  const enablePrewarm = useCallback(() => {
+    prewarmAllowed.current = true;
+    if (!prewarmDeferred.current) return;
+    prewarmDeferred.current = false;
+    prewarmLatest();
+  }, [prewarmLatest]);
+
+  const handleEvent = useCallback(
+    (data: Record<string, unknown>) => {
+      const event = data.event as string;
+      const slotId = data.slot_id as string | undefined;
+      // Before the switch, so liveness is a property of the wire rather than of
+      // the handful of frames somebody remembered to list (ARCH-329). A frame
+      // this switch ignores entirely still proves the conversation is alive.
+      if (slotId) noteFrame(slotId);
+
+      switch (event) {
+        case "sessions_list": {
+          const sessions = data.sessions as SlotInfo[];
+          // Claimed unconditionally: a reconnect that finds no live session has
+          // nothing to re-read, and leaving the flag armed would spend the
+          // re-read on some later roster instead.
+          const resync = needsResync.current;
+          needsResync.current = false;
+          if (sessions.length > 0) {
+            const known = new Set(sessions.map((s) => s.slot_id));
+            // A tab opened before the socket finished connecting — "Chat" on an
+            // agent's page is exactly that — is still waiting for its
+            // session_started, so the server cannot list it yet. It outlives
+            // this roster instead of being replaced by it, and keeps the focus:
+            // the user asked for that conversation, not for the oldest one.
+            const pendingLocal = slotsRef.current.filter(
+              (s) => s.pending && !known.has(s.info.slot_id),
+            );
+            const pendingIds = new Set(pendingLocal.map((s) => s.info.slot_id));
+            setSlots((prev) => {
+              // Keep whatever is already rendered for a known slot; a slot we
+              // have not seen starts empty and is filled by hydrateSlot below.
+              const existing = new Map(prev.map((s) => [s.info.slot_id, s]));
+              return [
+                ...sessions.map((info) => {
+                  const ex = existing.get(info.slot_id);
+                  return ex ? { ...ex, info, pending: false } : { info, messages: [] };
+                }),
+                ...pendingLocal,
+              ];
+            });
+            setActiveSlotId((prev) => {
+              if (prev && (known.has(prev) || pendingIds.has(prev))) return prev;
+              // Land on the conversation with the most recent turn rather than
+              // on whatever the roster lists first — server order is not
+              // recency, and the oldest chat is rarely the one you meant.
+              // Comparing the ISO strings is enough; they are all UTC. The
+              // roster itself is left in place: slot order is tab order, and
+              // reordering tabs on every reconnect would be its own annoyance.
+              const latest = sessions.reduce((best, s) =>
+                (s.last_prompt_at || "") > (best.last_prompt_at || "") ? s : best,
+              );
+              return latest.slot_id;
+            });
+            for (const info of sessions) {
+              void hydrateSlot(
+                info.conversation_id || info.slot_id,
+                info.slot_id,
+                resync,
+              );
+            }
+            // A roster with anything on it is the conversation to be in, so
+            // there is nothing to go looking for. A slot the backend reaped
+            // counts: prewarming would respawn it behind the user's back, and
+            // the message they eventually send reattaches it anyway.
+            prewarmed.current = true;
+          } else {
+            prewarmLatest();
+          }
+          break;
+        }
+
+        case "session_started": {
+          const newSlot: SlotInfo = {
+            slot_id: data.slot_id as string,
+            conversation_id: (data.conversation_id as string) || undefined,
+            agent_key: data.agent_key as string,
+            server_name: (data.server_name as string) || undefined,
+            server_pinned: Boolean(data.server_pinned),
+            agent_slug: (data.agent_slug as string) || "",
+            label: (data.label as string) || undefined,
+            // A `session_started` is a live subprocess by definition — the
+            // reattach path emits it without an `alive` key, so stating it here
+            // is what returns a detached tab's dot to green rather than leaving
+            // that to the "older backend" undefined fallback.
+            alive: true,
+          };
+          // The optimistic tab this session belongs to: a new chat is found by
+          // the ref it was opened under, a resume by the conversation itself.
+          const ref = (data.client_ref as string) || "";
+          const tabId = ref || newSlot.slot_id;
+          if (ref && ref !== newSlot.slot_id) {
+            refAliases.current[ref] = newSlot.slot_id;
+          }
+          // `delete` doubles as the membership test: an unfocused spawn is
+          // one-shot, and the set must not grow for the life of the tab. A
+          // resume has no ref, so it is filed under the conversation id — and
+          // a focused one is simply not in the set, which is the `false` that
+          // keeps every other resume adopting as before.
+          const adopt = !unfocusedRefs.current.delete(ref || newSlot.slot_id);
+          setSlots((prev) =>
+            prev.some((s) => s.info.slot_id === tabId)
+              ? prev.map((s) =>
+                  s.info.slot_id === tabId
+                    ? { ...s, info: newSlot, pending: false }
+                    : s,
+                )
+              : [...prev, { info: newSlot, messages: [] }],
+          );
+          setActiveSlotId((cur) =>
+            cur === tabId || (cur === null && adopt) ? newSlot.slot_id : cur,
+          );
+
+          // Anything typed while the spawn was in flight goes out now, in
+          // order. The bubbles are already on screen; only the wire lagged.
+          const queued = outbox.current[tabId] || [];
+          delete outbox.current[tabId];
+          if (queued.length) {
+            const convId = newSlot.conversation_id || newSlot.slot_id;
+            // Sequential, not `forEach`: an upload is an await, and racing two
+            // of them would let the second message overtake the first.
+            void (async () => {
+              for (const { text, view, files } of queued) {
+                await uploadAndSend(newSlot.slot_id, convId, text, view, files);
+              }
+            })();
+          }
+
+          // A resumed conversation arrives with a transcript; a brand new one
+          // is empty and hydrating it is a cheap no-op.
+          if (data.restored) {
+            void hydrateSlot(
+              newSlot.conversation_id || newSlot.slot_id,
+              newSlot.slot_id,
+            );
+          } else {
+            hydratedSlots.current.add(newSlot.slot_id);
+          }
+          break;
+        }
+
+        case "session_destroyed": {
+          const destroyedId = data.slot_id as string;
+          hydratedSlots.current.delete(destroyedId);
+          // Dropped rather than flushed: the slot is being removed, so its
+          // tail has nowhere to land, and `setSlots(remaining)` below replaces
+          // the state outright — a flush queued alongside it would be
+          // discarded anyway. Other slots keep their buffers and their open
+          // window; those flush onto the reduced list a moment later.
+          delete pendingChunks.current[destroyedId];
+          // The agent that was waiting on this is gone, so its approval is
+          // moot — and keeping it would strand an entry under a slot that no
+          // longer has a tab to answer from.
+          setPermissionRequests((prev) => {
+            if (!(destroyedId in prev)) return prev;
+            const next = { ...prev };
+            delete next[destroyedId];
+            return next;
+          });
+          // Same reason: a slot reaped mid-answer never gets its `prompt_done`,
+          // and an entry under a tab that no longer exists would keep the
+          // "something is streaming" flag true forever.
+          stopStreaming(destroyedId);
+          // Compute the slots that remain after removal once, outside any
+          // updater, so both setters below stay pure (safe under StrictMode /
+          // concurrent rendering, which may invoke updaters more than once).
+          const remaining = slotsRef.current.filter(
+            (s) => s.info.slot_id !== destroyedId,
+          );
+          setSlots(remaining);
+          // If the destroyed slot was active (or nothing was active), fall back
+          // to the first remaining slot; otherwise keep the current selection.
+          setActiveSlotId((cur) =>
+            cur === destroyedId || cur === null
+              ? (remaining[0]?.info.slot_id ?? null)
+              : cur,
+          );
+          break;
+        }
+
+        case "text_chunk": {
+          if (!slotId) break;
+          bufferChunk(slotId, "text", data.text as string);
+          break;
+        }
+
+        case "thought_chunk": {
+          if (!slotId) break;
+          bufferChunk(slotId, "thought", data.text as string);
+          break;
+        }
+
+        case "tool_call": {
+          if (!slotId) break;
+          const tc: ToolCall = {
+            tool_call_id: data.tool_call_id as string,
+            // Coerced, not cast: `as string` is a compile-time assertion that
+            // buys nothing off the wire, and a frame arriving without a title
+            // used to put `undefined` into a field typed `string`. The history
+            // path at the top of this hook has always coerced; this is the live
+            // path saying the same thing (CORR-326).
+            title: String(data.title ?? ""),
+            status: data.status as string,
+          };
+          appendToStream(slotId, (m) => ({
+            ...m,
+            toolCalls: [...m.toolCalls, tc],
+            // Its place in the run, beside the call itself. `appendToStream`
+            // has already committed whatever reasoning was buffered, so the
+            // step lands after the thinking that led to it.
+            events: [...(m.events ?? []), { type: "tool", id: tc.tool_call_id }],
+          }));
+          break;
+        }
+
+        case "tool_call_update": {
+          if (!slotId) break;
+          const tcId = data.tool_call_id as string;
+          const status = data.status as string | undefined;
+          // A name can arrive late. The ACP adapter announces a call before it
+          // knows what it is and supplies the title on a following update, so
+          // an update that carries one patches the name — exactly what
+          // `fold_tool_call_event` does on the way to disk
+          // (condor/acp/client.py). Ignoring it here was the whole of CORR-327:
+          // the row read "tool" while it ran and its real name after a reload,
+          // and a view that only heals on reload is the worst shape a
+          // disagreement can have.
+          //
+          // The asymmetry is deliberate and is the backend's, not a second one:
+          // a title is patched in only when it names something, so an update
+          // whose title says nothing — blank, or a placeholder like
+          // "undefined" — leaves the announced name standing rather than
+          // overwriting a real name with noise. `namesATool` is the renderer's
+          // own rule (39aaf321), asked here instead of restated.
+          const title = namesATool(data.title) ? String(data.title) : "";
+          // Addressed by the call's own id rather than by "whatever is
+          // streaming": a status that lands after the bubble stopped being
+          // current still belongs to the call it names.
+          updateSlotMessages(slotId, (msgs) =>
+            msgs.map((m) =>
+              m.toolCalls.some((tc) => tc.tool_call_id === tcId)
+                ? {
+                    ...m,
+                    toolCalls: m.toolCalls.map((tc) =>
+                      tc.tool_call_id === tcId
+                        ? {
+                            ...tc,
+                            status: status || tc.status,
+                            title: title || tc.title,
+                          }
+                        : tc,
+                    ),
+                  }
+                : m,
+            ),
+          );
+          break;
+        }
+
+        case "permission_request": {
+          // Filed under the conversation that asked, so it is only answerable
+          // from there. Concurrent requests from two slots coexist instead of
+          // clobbering each other.
+          const askingSlot = slotId || UNATTRIBUTED;
+          setPermissionRequests((prev) => ({
+            ...prev,
+            [askingSlot]: {
+              request_id: data.request_id as string,
+              summary: data.summary as string,
+              origin: (data.origin as string) || "",
+              tool: typeof data.tool === "string" ? data.tool : undefined,
+              input: (data.input as Record<string, unknown> | null | undefined) ?? null,
+              deadline: deadlineFrom(data.expires_in),
+            },
+          }));
+          break;
+        }
+
+        case "prompt_interrupted": {
+          // The user redirected the agent. Whatever had streamed so far is
+          // committed and marked, rather than left looking like a finished
+          // answer that trailed off — the alternative the old dead composer
+          // avoided by never letting this happen at all.
+          if (!slotId) break;
+          // Steering denies whatever the turn was waiting on
+          // (`condor.runtime.client.prompt`), so an approval still on screen
+          // would offer an Allow that can no longer do anything.
+          setPermissionRequests((prev) => {
+            if (!(slotId in prev)) return prev;
+            const next = { ...prev };
+            delete next[slotId];
+            return next;
+          });
+          flushChunks(slotId);
+          updateSlotMessages(slotId, (prev) => {
+            const msgs = settleToolCalls(prev);
+            // The partial is the last thing the agent said. The user's new
+            // message is already below it — `sendMessage` appended it before
+            // the wire even carried it — so this walks back to find it.
+            const idx = msgs.map((m) => m.role).lastIndexOf("assistant");
+            if (idx < 0) return msgs;
+            const marked = [...msgs];
+            marked[idx] = { ...marked[idx], interrupted: true };
+            return marked;
+          });
+          stopStreaming(slotId);
+          break;
+        }
+
+        case "queued": {
+          // Accepted, not started. Saying so is the difference between "the
+          // dashboard ate my message" and "it is next in line".
+          if (!slotId) break;
+          setQueuedSlots((prev) => (prev[slotId] ? prev : { ...prev, [slotId]: true }));
+          break;
+        }
+
+        case "reload": {
+          // The agent's configuration changed while this chat was open — a
+          // playbook or tool switched off in the brain panel, its model or
+          // instructions edited — so the session was rebuilt before answering
+          // this message (FEAT-093). Saying so is the point: a reload costs the
+          // scrollback older than the replay budget, and the reader should know
+          // why the counterpart suddenly has less of the conversation.
+          // The backend records the same sentence in the transcript, so a page
+          // reload agrees with what is on screen.
+          if (!slotId) break;
+          flushChunks(slotId);
+          const parts = (data.parts as string[]) || [];
+          appendSystemNote(
+            slotId,
+            `Reloaded to apply configuration changes (${parts.join(", ")})`,
+            "reload",
+          );
+          break;
+        }
+
+        case "system_note": {
+          // Something finished in the background and wrote a note into the
+          // transcript — a routine's outcome, most often. The note is already
+          // recorded server-side; this only puts it on screen without a reload.
+          // Appended after the buffered text so it cannot cut an answer in half.
+          if (!slotId) break;
+          flushChunks(slotId);
+          const noteText = (data.text as string) || "";
+          const noteKind = (data.kind as string) || undefined;
+          if (!noteText) break;
+          appendSystemNote(slotId, noteText, noteKind);
+          break;
+        }
+
+        case "secret_notice": {
+          // The funnel found something key-shaped in what was just sent
+          // (FEAT-056). A `certain` kind was already replaced before the model
+          // saw it and before anything was written; an ambiguous one was left
+          // alone, because in this app that shape is a transaction far more
+          // often than a key. The server sends the kind, never the value, and
+          // sends it at most once per conversation per kind — so the wording
+          // is composed here rather than shipped over the wire.
+          if (!slotId) break;
+          flushChunks(slotId);
+          const secretKind = data.kind as string;
+          const text = SECRET_NOTICES[secretKind];
+          if (!text) break;
+          appendSystemNote(slotId, text, "secret_notice");
+          break;
+        }
+
+        case "prompt_done":
+          if (slotId) {
+            // The tail of the answer is still buffered when the prompt ends
+            // inside an open window, so this is what guarantees the last
+            // tokens land — and it closes the turn, which used to be a
+            // separate line here. Both updaters are queued in this same batch,
+            // so the settle below sees the flushed transcript.
+            flushChunks(slotId);
+            // Mark any in-flight tool calls as completed so the spinner stops
+            updateSlotMessages(slotId, settleToolCalls);
+            // Only this conversation ended. Another tab may still be
+            // mid-answer, and its composer stays locked until its own turn is
+            // done.
+            stopStreaming(slotId);
+            // What the turn cost, onto the total (FEAT-120). A frame without
+            // it — an older backend, a DONE the funnel did not charge — leaves
+            // the total where it was.
+            const turnUsage = data.usage as Partial<TokenUsage> | null | undefined;
+            if (turnUsage) {
+              setSlots((prev) =>
+                prev.map((s) =>
+                  s.info.slot_id === slotId
+                    ? { ...s, usage: addUsage(s.usage, turnUsage) }
+                    : s,
+                ),
+              );
+            }
+          }
+          break;
+
+        case "error": {
+          // A spawn that failed names the optimistic tab it could not fill;
+          // everything else names the slot it was streaming into.
+          const errSlotId = (data.client_ref as string) || slotId || null;
+          // Whatever streamed before the failure belongs in its own bubble,
+          // above the error bubble appended below — and the turn is over, so
+          // the next response starts a new bubble.
+          flushChunks(errSlotId || undefined);
+          // The failure joins the transcript in the shape the transcript
+          // already records it in: the recorder writes a failed prompt as
+          // `TurnEntry(role="system", kind="error")`, so appending a synthetic
+          // *assistant* turn with a `⚠️` glued to the front made the same event
+          // read one way live and another after a reload — and put words in
+          // the agent's mouth that the agent never said. `error` is a note
+          // kind now, so the glyph and the label come from the renderer and
+          // the text is the backend's own message, unadorned.
+          const errMsg = (data.message as string) || "Unknown error";
+          if (errSlotId) {
+            // Nothing is coming for a tab whose spawn failed — dropping
+            // `pending` stops the input pretending the queue will drain.
+            delete outbox.current[errSlotId];
+            setSlots((prev) =>
+              prev.map((s) => {
+                if (s.info.slot_id !== errSlotId) return s;
+                return {
+                  ...s,
+                  pending: false,
+                  messages: [...s.messages, systemNote(errMsg, "error")],
+                };
+              }),
+            );
+            stopStreaming(errSlotId);
+          }
+          break;
+        }
+
+        case "notification": {
+          // A background task finished (FEAT-048). Addressed to the *user*, not
+          // to a conversation, so it carries no slot and goes nowhere near the
+          // transcript — it lands in the bell's react-query cache, which is the
+          // same place `GET /notifications` fills on mount. Writing into the
+          // cache rather than into local state is what lets the bell be a leaf
+          // component with no wiring back up to here.
+          const incoming: AppNotification = {
+            id: (data.id as string) || "",
+            user_id: 0,
+            ts: (data.ts as number) || Date.now() / 1000,
+            kind: (data.kind as string) || "system",
+            text: (data.text as string) || "",
+            title: (data.title as string) || null,
+            link: (data.link as string) || null,
+            read: false,
+          };
+          if (!incoming.id) break;
+          queryClient.setQueryData<NotificationsResponse>(
+            NOTIFICATIONS_KEY,
+            (prev) => {
+              // A reconnect can replay one we already hold; keyed by id so it
+              // is never listed twice.
+              const rest = (prev?.items ?? []).filter((n) => n.id !== incoming.id);
+              const items = [incoming, ...rest].slice(0, 50);
+              return { items, unread: items.filter((n) => !n.read).length };
+            },
+          );
+          break;
+        }
+
+        case "heartbeat":
+          // Nothing to draw — a heartbeat carries no content. It is not inert,
+          // though: `noteFrame` above already took it, and taking it is the
+          // whole reason the stall watchdog can tell a lost turn from a slow
+          // one. `ACPClient._stream` emits one every 30s that its event queue
+          // stays empty, so this frame is a healthy prompt's proof of life
+          // during exactly the long silences that would otherwise look dead.
+          break;
+      }
+    },
+    [
+      appendSystemNote,
+      appendToStream,
+      bufferChunk,
+      flushChunks,
+      hydrateSlot,
+      noteFrame,
+      prewarmLatest,
+      queryClient,
+      stopStreaming,
+      updateSlotMessages,
+      uploadAndSend,
+    ],
+  );
+
+  const sendMessage = useCallback(
+    (slotId: string, text: string, files?: File[]) => {
+      const id = nextMsgId();
+      // Anything still buffered was said before this question and has to be
+      // committed above it — once the user's bubble is last, the tail would
+      // land in a new assistant bubble *below* the question.
+      //
+      // The same call closes whatever bubble was open. The wire is supposed to
+      // say so with `prompt_done`, but that event can be missed (a WS drop
+      // mid-answer) — and a bubble left open would swallow the *next* answer
+      // into a bubble sitting above this message, reading as an answer given
+      // before it was asked.
+      flushChunks(slotId);
+      // Previewed from the bytes the browser already has — the object URL costs
+      // no round trip, and putting the bubble on screen before the upload is
+      // what makes a deferred upload invisible to the user.
+      const previews: ChatAttachment[] = (files || []).map((file) => ({
+        url: URL.createObjectURL(file),
+        mime: file.type,
+        local: true,
+      }));
+      updateSlotMessages(slotId, (msgs) => [
+        ...settleToolCalls(msgs),
+        {
+          id,
+          role: "user" as const,
+          text,
+          toolCalls: [],
+          ts: nowTs(),
+          attachments: previews.length ? previews : undefined,
+        },
+      ]);
+
+      // What the user is looking at while asking, rendered here so it is true
+      // of this moment. It travels beside the text, never inside it: the
+      // backend prepends it to this one prompt and records only the user's
+      // words (FEAT-059).
+      const view = renderViewBlock(collectViewFacts());
+
+      // A tab whose spawn is still in flight has no id the backend knows yet,
+      // so the message waits here rather than being sent into the void.
+      const slot = slotsRef.current.find((s) => s.info.slot_id === slotId);
+      if (slot?.pending) {
+        // The `File`s wait here with the words. Uploading now would write into a
+        // conversation directory the spawn has not created yet.
+        (outbox.current[slotId] ||= []).push({ text, view, files });
+        return;
+      }
+
+      // For a web slot the slot id *is* the conversation id; `conversation_id`
+      // is read first all the same, because that is the field that stays true
+      // if the two ever diverge.
+      void uploadAndSend(
+        slotId,
+        slot?.info.conversation_id || slotId,
+        text,
+        view,
+        files,
+      );
+    },
+    [flushChunks, updateSlotMessages, uploadAndSend],
+  );
+
+  /**
+   * Repoint one slot, and mark the scrollback if the move is worth marking.
+   *
+   * A brain switch and a server switch are the same edit — merge the session's
+   * new fields into the slot's `info`, then append a divider — and differ only
+   * in which fields move and in when the move earns a divider at all. Both
+   * answers are read off the *previous* info (a server switch is suppressed by
+   * comparing the old server name against the new one), so the caller hands in
+   * a function of it rather than a finished pair.
+   */
+  const applySwitch = useCallback(
+    (
+      slotId: string,
+      compute: (prev: SlotInfo) => { info: SlotInfo; divider?: string },
+    ) => {
+      setSlots((prev) =>
+        prev.map((s) => {
+          if (s.info.slot_id !== slotId) return s;
+          const { info, divider } = compute(s.info);
+          if (!divider) return { ...s, info };
+          return {
+            ...s,
+            info,
+            messages: [...s.messages, systemNote(divider, "switch")],
+          };
+        }),
+      );
+    },
+    [],
+  );
+
+  /**
+   * Rebind the chat to a different brain, mid-conversation.
+   *
+   * The subprocess is replaced — ACP has no identity hot-swap — but the
+   * conversation is not: the backend respawns under the same key and replays
+   * the transcript, and records the handover so it shows as a divider.
+   */
+  const switchBrain = useCallback(
+    async (slotId: string, selection: { agentSlug?: string; agentKey?: string }) => {
+      if (!user) return;
+      const key = webSessionKey(user.id, slotId);
+      const { session } = await api.switchSession(key, {
+        agent_slug: selection.agentSlug,
+        agent_key: selection.agentKey,
+      });
+      // The outgoing brain's last words belong above the divider that retires
+      // it, not in a new bubble underneath it.
+      flushChunks();
+      applySwitch(slotId, (prev) => ({
+        info: {
+          ...prev,
+          agent_key: session.agent_key,
+          // A brain switch can move the server too: binding to an Agent that
+          // pins one overrides the chat's ambient choice, and unbinding
+          // hands it back. Both are read off the respawned session.
+          server_name: session.server_name || undefined,
+          server_pinned: session.server_pinned,
+          agent_slug: session.agent_slug,
+          label: session.label,
+        },
+        // Only a change of *who* divides the scrollback; a model swap under
+        // the same identity is not a handover the reader needs marked.
+        divider:
+          selection.agentSlug === undefined
+            ? undefined
+            : `Switched to ${session.label}`,
+      }));
+    },
+    [applySwitch, flushChunks, user],
+  );
+
+  /**
+   * Move this conversation to another server, mid-chat.
+   *
+   * The same trade as a brain switch, for the same reason: the server is baked
+   * into the MCP subprocess's args at spawn, so repointing it means reaping the
+   * process and replaying the transcript into its replacement. The divider is
+   * appended locally because the scrollback is not re-hydrated after a switch —
+   * the backend records the same line in the transcript, so a reload agrees.
+   */
+  const switchServer = useCallback(
+    async (slotId: string, serverName: string) => {
+      if (!user) return;
+      const key = webSessionKey(user.id, slotId);
+      const { session } = await api.switchSession(key, { server_name: serverName });
+      // Same ordering rule as the brain switch: buffered text first, divider
+      // after it.
+      flushChunks();
+      applySwitch(slotId, (prev) => ({
+        info: {
+          ...prev,
+          server_name: session.server_name || undefined,
+          server_pinned: session.server_pinned,
+        },
+        // Only an actual move divides the scrollback. A pinned Agent ignores
+        // the request, and a divider claiming otherwise would be a lie.
+        divider:
+          session.server_name === prev.server_name
+            ? undefined
+            : `Now using server ${session.server_name}`,
+      }));
+    },
+    [applySwitch, flushChunks, user],
+  );
+
+  const destroySession = useCallback(
+    (slotId: string) => {
+      delete outbox.current[slotId];
+      // The tab is going away, so its tail has nowhere to land: flushing it
+      // would only write into a conversation the user just closed.
+      delete pendingChunks.current[slotId];
+      // A new chat closed before its conversation was minted has no id the
+      // backend knows, so there is nothing to ask it to destroy. (A pending
+      // *resume* does have one, and destroy_session waits for its spawn.)
+      const slot = slotsRef.current.find((s) => s.info.slot_id === slotId);
+      if (slot?.pending && !slot.info.conversation_id) {
+        const remaining = slotsRef.current.filter((s) => s.info.slot_id !== slotId);
+        setSlots(remaining);
+        setActiveSlotId((cur) =>
+          cur === slotId ? (remaining[0]?.info.slot_id ?? null) : cur,
+        );
+        return;
+      }
+      // Only the session goes; the transcript stays on the server, which is
+      // what makes this reversible.
+      send({ action: "destroy_session", slot_id: slotId });
+    },
+    [send],
+  );
+
+  const abortPrompt = useCallback(
+    (slotId: string) => {
+      send({ action: "abort_prompt", slot_id: slotId });
+      // What already arrived is part of the transcript even though the user
+      // stopped the rest of it; the turn ends with it.
+      flushChunks(slotId);
+      // Immediately reset this slot's streaming state so the UI doesn't get
+      // stuck if the backend's prompt_done event is lost or delayed. Aborting
+      // one conversation says nothing about the others.
+      stopStreaming(slotId);
+      // Mark any in-flight tool calls as completed
+      updateSlotMessages(slotId, settleToolCalls);
+    },
+    [flushChunks, send, stopStreaming, updateSlotMessages],
+  );
+
+  const resolvePermission = useCallback(
+    (requestId: string, approved: boolean) => {
+      send({ action: "resolve_permission", request_id: requestId, approved });
+      // Only the request just answered is dropped. Clearing the whole map
+      // would discard a confirmation another conversation is still waiting
+      // on, leaving that agent stalled until its TTL denies it.
+      setPermissionRequests((prev) => {
+        const entries = Object.entries(prev).filter(
+          ([, req]) => req.request_id !== requestId,
+        );
+        return entries.length === Object.keys(prev).length
+          ? prev
+          : Object.fromEntries(entries);
+      });
+    },
+    [send],
+  );
+
+  // Unmounting the tree that hosts the provider — logging out is the one that
+  // matters — must end the connection for good, not just until the next retry.
+  useEffect(() => {
+    return () => {
+      shouldConnect.current = false;
+      closeSocket();
+      // Cancelled, not flushed. There is no state left to flush into — this
+      // hook owns the slots and they go with it — and a timer surviving the
+      // unmount would be a `setSlots` on a dead tree. Nothing is actually
+      // lost: the backend records every turn (FEAT-015), so a remount
+      // re-hydrates the transcript from the server rather than from here.
+      clearTimeout(flushTimer.current);
+      flushTimer.current = undefined;
+      pendingChunks.current = {};
+    };
+  }, [closeSocket]);
+
+  useEffect(() => {
+    slotsRef.current = slots;
+  }, [slots]);
+
+  const activeSlot = slots.find((s) => s.info.slot_id === activeSlotId) || null;
+  /**
+   * Is *this* conversation mid-answer? The only question a consumer should ask.
+   *
+   * A slot that has gone silent past the watchdog's patience answers *no* while
+   * it stays silent (ARCH-329). "A turn was started and nothing ended it" is
+   * not the same claim as "an answer is arriving", and it is the second one
+   * every caller here is really making — the spinner, the Stop button, the
+   * disabled brain picker, the run strip held open. Answering from the one
+   * place they all ask is what settles them together, without a component
+   * having to learn what a stall is.
+   */
+  const isSlotStreaming = useCallback(
+    (slotId: string | null | undefined) =>
+      !!slotId && slotId in streamingSlots && !(slotId in stalledSlots),
+    [streamingSlots, stalledSlots],
+  );
+  /** Any conversation at all, for chrome that is not tied to one tab. */
+  const isStreaming = Object.keys(streamingSlots).some((id) => !(id in stalledSlots));
+  /** Is *this* conversation waiting for the turn ahead of it to finish? */
+  const isSlotQueued = useCallback(
+    (slotId: string | null | undefined) => !!slotId && slotId in queuedSlots,
+    [queuedSlots],
+  );
+  // What *one* conversation is being asked to approve — and nothing else. A
+  // request raised elsewhere stays in the map, where the tab strip badges it,
+  // so it is visible without being answerable from the wrong chat. A selector
+  // rather than a value derived from `activeSlotId`, so a surface that is not
+  // the active one — the bubble — can answer its own approvals (FEAT-059).
+  const permissionFor = useCallback(
+    (slotId: string | null | undefined) =>
+      (slotId ? permissionRequests[slotId] : undefined) ||
+      permissionRequests[UNATTRIBUTED] ||
+      null,
+    [permissionRequests],
+  );
+
+  /** Follow the spawn's rename: the live slot id behind a possibly-stale one. */
+  const resolveSlotId = useCallback(
+    (id: string): string => refAliases.current[id] ?? id,
+    [],
+  );
+
+  return {
+    isConnected,
+    slots,
+    activeSlot,
+    activeSlotId,
+    setActiveSlotId,
+    isStreaming,
+    streamingSlots,
+    isSlotStreaming,
+    isSlotQueued,
+    permissionFor,
+    permissionRequests,
+    resolveSlotId,
+    connect,
+    enablePrewarm,
+    disconnect,
+    sendMessage,
+    startSession,
+    resumeConversation,
+    switchBrain,
+    switchServer,
+    destroySession,
+    abortPrompt,
+    resolvePermission,
+  };
+}

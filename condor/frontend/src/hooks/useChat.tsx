@@ -1,0 +1,95 @@
+import { createContext, useContext, useEffect } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import { useChatSocket } from "@/hooks/useChatSocket";
+import { useConversationParam } from "@/hooks/useConversationParam";
+import {
+  api,
+  type AgentBindingOption,
+  type ChatAgentOption,
+  type CustomProvider,
+} from "@/lib/api";
+
+/**
+ * One chat, however many surfaces are looking at it.
+ *
+ * `useChatSocket` keeps the socket, the slots, the streaming slot, the prewarm
+ * guard and the outbox in a single instance. Calling it twice would open a
+ * second socket, spawn a second subprocess against the session budget, and give
+ * the two callers different ideas about what was said — so it is called once,
+ * here, and the chat workspace at `/` — `AgentChatTab` and everything it
+ * renders — reads that one state.
+ */
+const ChatContext = createContext<ReturnType<typeof useChatSocket> | null>(null);
+
+export function ChatProvider({ children }: { children: React.ReactNode }) {
+  const chat = useChatSocket();
+
+  // The socket is opened here, not by the chat workspace, because it carries
+  // more than chat: `notification` frames are the only live push path the
+  // dashboard has (FEAT-048), and a session that starts on /executors — a
+  // reload, a bookmark, a click on a notification's own link — used to never
+  // open it at all, leaving the bell frozen for the whole visit. Connecting
+  // from the shell does not spawn anything: prewarming stays gated behind
+  // `enablePrewarm`, which only the workspace calls.
+  useEffect(() => {
+    chat.connect();
+  }, [chat.connect]);
+
+  // `?conversation=<id>` opens one conversation, from wherever the link was
+  // (FEAT-111). Read here for the same reason the socket is: the slots live in
+  // this provider, so a link that lands on any route can hand one over without
+  // waiting for the chat workspace to mount.
+  useConversationParam(chat.resumeConversation);
+
+  return <ChatContext value={chat}>{children}</ChatContext>;
+}
+
+export function useChat() {
+  const chat = useContext(ChatContext);
+  if (!chat) throw new Error("useChat must be used within a ChatProvider");
+  return chat;
+}
+
+// ── Chat options ──
+
+export interface SessionOptions {
+  agents: ChatAgentOption[];
+  customProviders: CustomProvider[];
+  agentBindings: AgentBindingOption[];
+  defaultAgent: string;
+}
+
+/** What the picker falls back to when `/sessions/options` cannot be read. */
+const FALLBACK: SessionOptions = {
+  agents: [{ key: "claude-code", label: "Claude Code" }],
+  customProviders: [],
+  agentBindings: [],
+  defaultAgent: "claude-code",
+};
+
+/**
+ * Who can answer, and on what.
+ *
+ * `/sessions/options` carries the picker whole: the agents and custom
+ * providers that can answer, and the domain Agents a session can be bound to —
+ * that is the "Agents" section. It is a near-static payload
+ * every chat surface needs, so it goes through react-query on one key: fetched
+ * once, shared by the panel and the workspace.
+ */
+export function useSessionOptions(enabled = true): SessionOptions {
+  const { data } = useQuery({
+    queryKey: ["session-options"],
+    queryFn: api.getSessionOptions,
+    staleTime: Infinity,
+    enabled,
+  });
+
+  if (!data) return FALLBACK;
+  return {
+    agents: data.agents,
+    customProviders: data.custom_providers ?? [],
+    agentBindings: data.agent_bindings ?? [],
+    defaultAgent: data.default_agent,
+  };
+}

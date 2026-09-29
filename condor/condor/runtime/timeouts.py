@@ -1,0 +1,134 @@
+"""Every deadline in the runtime, in one place.
+
+The constants used to be scattered: the prompt lock and overall budget in the
+session module, the confirmation TTL in the chat WebSocket route, tick budgets
+in the engine, call timeouts in the MCP client. Changing "how long may a prompt
+run" meant finding all of them and hoping you had.
+
+Each field can be overridden per deployment with ``CONDOR_TIMEOUT_<FIELD>``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, fields
+
+log = logging.getLogger(__name__)
+
+ENV_PREFIX = "CONDOR_TIMEOUT_"
+
+
+@dataclass(frozen=True)
+class TimeoutPolicy:
+    """Deadlines, in seconds."""
+
+    # How long to wait for a session's prompt lock before giving up. Guards
+    # against a stuck previous prompt blocking the chat forever.
+    prompt_lock: int = 30
+    # How long a deliberately queued message waits for its turn. Longer than
+    # prompt_lock, which guards against a *stuck* prompt rather than a busy
+    # one: a message waiting behind a five-minute answer is not a fault.
+    prompt_queue: int = 900
+    # Wall-clock budget for a single prompt. Kills runaway agent turns.
+    prompt_overall: int = 1800
+    # How long to wait for an agent to confirm session/cancel before falling
+    # back to cancelling the request locally. Short on purpose: this is what
+    # Stop costs the user, and stopping the *relay* is instant either way.
+    prompt_cancel: int = 2
+    # How long the NEXT prompt waits for an abandoned turn to actually end at
+    # the agent. Separate from prompt_cancel because it buys something else:
+    # ACP session/update notifications carry no request id, so a second turn
+    # opened while the first is still generating has the first one's chunks
+    # delivered as its own answer. Paid only when an agent ignored the cancel.
+    prompt_settle: int = 10
+    # How long a human has to answer a dangerous-tool confirmation.
+    confirmation: int = 120
+    # Keepalive cadence on an SSE stream, so proxies and clients see traffic.
+    sse_heartbeat: float = 10.0
+    # Upper bound on a single SSE prompt stream.
+    sse_stream: int = 1800
+    # Budget for one MCP tool call.
+    mcp_call: float = 15.0
+    # How long to probe a local inference server for the model it serves, when
+    # a bare "ollama:" / "lmstudio:" key leaves the model id to us. Short: it
+    # is a localhost request on the session-start path, and a backend that is
+    # down should fall through to the explicit-key error quickly.
+    local_model_probe: float = 2.0
+    # How long an agent client may take to become usable: the ACP
+    # ``initialize`` + ``session/new`` handshake, and the pydantic-ai wait for
+    # its MCP servers to come up. Generous because a cold start can include an
+    # ``npx`` fetch of the bridge, but bounded: a child that spawns and never
+    # answers used to park the caller forever, holding a per-user session slot
+    # and the session-creation lock behind it (CORR-333).
+    agent_handshake: int = 120
+    # Wall-clock budget for one agent session: a strategy tick's LLM turn, and
+    # the shutdown cleanup pass that runs under the same ceiling. 10 minutes.
+    tick_default: int = 600
+    # How long a live session may sit unprompted before the health monitor
+    # detaches it. Every other deadline here bounds a *turn*; this one bounds a
+    # *session* — an abandoned chat holds an agent subprocess, the MCP tree it
+    # was spawned with, and one of the five per-user session slots, forever.
+    # The conversation is durable (FEAT-015), so this is a detach, not a loss.
+    # 0 disables the sweep. 1 hour.
+    session_idle: int = 3600
+
+    @property
+    def prompt_hard_stop(self) -> int:
+        """The ACP stream's own ceiling: one minute above the turn budget.
+
+        ``prompt_overall`` is the deadline the *session* enforces; this is the
+        backstop under it inside ``ACPClient.prompt_stream``, so a subprocess
+        that stops answering ends even when nobody is watching the session.
+        Derived rather than stored so that raising
+        ``CONDOR_TIMEOUT_PROMPT_OVERALL`` moves both together — a stored copy
+        is exactly how a ``1860`` literal in the ACP client drifted out of
+        reach of this policy in the first place.
+        """
+        return self.prompt_overall + 60
+
+    @classmethod
+    def load(cls) -> "TimeoutPolicy":
+        """Build the policy, applying CONDOR_TIMEOUT_* overrides.
+
+        An unparseable override is logged and ignored rather than crashing the
+        process at import time — a typo in an env var must not stop the bot.
+        """
+        overrides: dict[str, float] = {}
+        for f in fields(cls):
+            raw = os.environ.get(f"{ENV_PREFIX}{f.name.upper()}")
+            if raw is None:
+                continue
+            try:
+                overrides[f.name] = int(raw) if f.type == "int" else float(raw)
+            except ValueError:
+                log.warning(
+                    "Ignoring %s%s=%r: not a number",
+                    ENV_PREFIX,
+                    f.name.upper(),
+                    raw,
+                )
+        return cls(**overrides)
+
+
+TIMEOUTS = TimeoutPolicy.load()
+
+
+def resolve_tick_timeout(
+    execution_mode: str = "loop",
+    caller: int | None = None,
+    strategy: int | None = None,
+) -> int:
+    """Pick an agent-session budget: caller override > run config > policy.
+
+    ``strategy`` is the run's ``tick_timeout_sec``; 0 or None means "no opinion",
+    which falls through to ``tick_default`` (10 min, or CONDOR_TIMEOUT_TICK_DEFAULT).
+    ``execution_mode`` is accepted so a future policy can price attended runs
+    (dry_run / run_once) differently from unattended loops; today they share one
+    budget, and saying so here beats a branch that pretends otherwise.
+    """
+    if caller:
+        return int(caller)
+    if strategy:
+        return int(strategy)
+    return TIMEOUTS.tick_default

@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import asdict
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from condor.archived_controllers import group_by_controller
+from condor.fetchers._identifiers import IdentifierError, validate_db_path
+from condor.fetchers.archived_run import (
+    ArchivedRunUnavailable,
+    cached_run,
+    extract_bot_name,
+    fetch_archived_run,
+)
+from condor.reports import subjects
+from condor.reports.store import list_reports
+from condor.web.auth import require_server_access
+from condor.web.models import (
+    ArchivedBotPerformance,
+    ArchivedBotSummary,
+    ArchivedControllerRollup,
+    ArchivedControllers,
+    ArchivedRunReport,
+    PaginatedExecutors,
+    WebUser,
+)
+from condor.web.routes._errors import upstream_error
+from config_manager import get_config_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["archived"])
+
+
+def _checked_db_path(db_path: str) -> str:
+    """The database to read, or a 400 for a value that is not a database path.
+
+    ``db_path`` arrives as a *query* parameter — so unlike a path parameter it
+    still carries ``/``, ``..``, ``?`` and ``#`` — and ends up interpolated raw
+    into the upstream URL (``f"/archived-bots/{db_path}/summary"``), where yarl
+    parses rather than escapes it. Refused here, before a client is built, so a
+    rejected value never becomes an authenticated GET against some other backend
+    endpoint (SEC-591, the SEC-115 class).
+    """
+    try:
+        return validate_db_path(db_path)
+    except IdentifierError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+async def _load_run(client: Any, name: str, db_path: str) -> ArchivedBotPerformance:
+    """The run's performance, or the HTTP answer for why it cannot be read."""
+    try:
+        return await fetch_archived_run(client, name, db_path)
+    except ArchivedRunUnavailable as e:
+        raise HTTPException(status_code=404 if e.missing else 502, detail=e.detail)
+
+
+async def _get_bot_summary(client: Any, db_path: str) -> ArchivedBotSummary | None:
+    """Fetch summary for a single archived bot database."""
+    try:
+        summary = await client.archived_bots.get_database_summary(db_path)
+        if not summary or not isinstance(summary, dict):
+            return None
+
+        return ArchivedBotSummary(
+            bot_name=summary.get("bot_name") or extract_bot_name(db_path),
+            db_path=db_path,
+            total_trades=int(summary.get("total_trades", 0)),
+            total_orders=int(summary.get("total_orders", 0)),
+            trading_pairs=summary.get("trading_pairs", []),
+            exchanges=summary.get("exchanges", []),
+            start_time=summary.get("start_time"),
+            end_time=summary.get("end_time"),
+        )
+    except Exception as e:
+        logger.debug("Failed to get summary for %s: %s", db_path, e)
+        return None
+
+
+@router.get("/servers/{name}/archived")
+async def list_archived_bots(name: str, user: WebUser = Depends(require_server_access)):
+    cm = get_config_manager()
+
+    client = await cm.get_client(name)
+
+    try:
+        databases = await client.archived_bots.list_databases()
+    except Exception as e:
+        logger.exception("Failed to list archived databases on '%s'", name)
+        raise upstream_error("Failed to list databases", e)
+
+    if not databases or not isinstance(databases, list):
+        return {"bots": []}
+
+    # Filter healthy databases
+    healthy_paths: list[str] = []
+    for db in databases:
+        if isinstance(db, str):
+            healthy_paths.append(db)
+        elif isinstance(db, dict):
+            path = db.get("db_path") or db.get("path", "")
+            if path:
+                status = db.get("status", "healthy")
+                if status != "error":
+                    healthy_paths.append(path)
+
+    # Fetch summaries in parallel
+    tasks = [_get_bot_summary(client, path) for path in healthy_paths]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    bots = []
+    for result in results:
+        if isinstance(result, ArchivedBotSummary):
+            bots.append(result)
+
+    return {"bots": bots}
+
+
+@router.get(
+    "/servers/{name}/archived/performance", response_model=ArchivedBotPerformance
+)
+async def get_archived_performance(
+    name: str,
+    db_path: str = Query(..., description="Database path"),
+    include_executors: bool = Query(
+        False, description="Include full executor list in response"
+    ),
+    user: WebUser = Depends(require_server_access),
+):
+    db_path = _checked_db_path(db_path)
+
+    cm = get_config_manager()
+
+    client = await cm.get_client(name)
+
+    perf = await _load_run(client, name, db_path)
+
+    if not include_executors:
+        # Return without executors for fast initial load
+        return perf.model_copy(update={"executors": []})
+
+    return perf
+
+
+@router.get("/servers/{name}/archived/executors", response_model=PaginatedExecutors)
+async def get_archived_executors(
+    name: str,
+    db_path: str = Query(..., description="Database path"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: WebUser = Depends(require_server_access),
+):
+    db_path = _checked_db_path(db_path)
+
+    cm = get_config_manager()
+
+    # Page out of the cached performance entry; on a miss, trigger the full
+    # (single-flight) fetch.
+    perf = cached_run(name, db_path)
+    if perf is None:
+        client = await cm.get_client(name)
+        perf = await _load_run(client, name, db_path)
+
+    executors = perf.executors
+    page = executors[offset : offset + limit]
+
+    return PaginatedExecutors(
+        executors=page,
+        total=len(executors),
+        offset=offset,
+        limit=limit,
+    )
+
+
+@router.get("/servers/{name}/archived/controllers", response_model=ArchivedControllers)
+async def get_archived_controllers(
+    name: str,
+    db_path: str = Query(..., description="Database path"),
+    user: WebUser = Depends(require_server_access),
+):
+    """The run, split into the controllers that ran inside it.
+
+    Reads the same cached performance object the run's header and executor
+    pages come from, so expanding a row costs nothing once the run is warm.
+    """
+    db_path = _checked_db_path(db_path)
+
+    perf = cached_run(name, db_path)
+    if perf is None:
+        client = await get_config_manager().get_client(name)
+        perf = await _load_run(client, name, db_path)
+
+    return ArchivedControllers(
+        controllers=[
+            ArchivedControllerRollup(**asdict(rollup))
+            for rollup in group_by_controller(perf.executors)
+        ]
+    )
+
+
+@router.get("/servers/{name}/archived/report", response_model=ArchivedRunReport)
+async def get_archived_report(
+    name: str,
+    db_path: str = Query(..., description="Database path"),
+    controller_id: str = Query("", description="Controller inside the run, or all"),
+    user: WebUser = Depends(require_server_access),
+):
+    """The stored report for this run (or controller), if one was ever made.
+
+    The subject key is built here, from the parts, never accepted pre-built:
+    the server is the one the caller was granted access to, so a lookup cannot
+    be pointed at another server's reports by spelling its key.
+
+    A miss is the ordinary case — nothing has charted this subject yet, or the
+    report index has since been pruned past it — so it answers 200 with a null
+    id rather than a 404.
+    """
+    db_path = _checked_db_path(db_path)
+
+    entries, _ = list_reports(
+        subject=subjects.bot_run(name, db_path, controller_id),
+        owner_id=user.id,
+        limit=1,
+    )
+    if not entries:
+        return ArchivedRunReport()
+
+    entry = entries[0]
+    return ArchivedRunReport(
+        report_id=entry.get("id"),
+        created_at=entry.get("created_at"),
+        title=entry.get("title", ""),
+    )

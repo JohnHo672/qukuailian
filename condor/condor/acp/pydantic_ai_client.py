@@ -1,0 +1,1405 @@
+"""Pydantic AI agent client -- uses pydantic-ai with MCP tool servers.
+
+Drop-in alternative to ACPClient for open-source / local models.
+Supports any model backend that pydantic-ai supports: ollama, openai-compatible
+(LM Studio), groq, anthropic, etc.
+
+Yields the same ACPEvent types so TickEngine can consume it identically.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import time
+import uuid
+from typing import Any, AsyncIterator, Iterator
+from urllib.parse import urlparse
+
+from .client import (
+    ACPEvent,
+    Heartbeat,
+    PermissionCallback,
+    PromptDone,
+    TextChunk,
+    ThoughtChunk,
+    ToolCallEvent,
+    ToolCallUpdate,
+)
+from .usage import TokenUsage
+
+log = logging.getLogger(__name__)
+
+
+# Model prefix → pydantic-ai model string mapping
+# Users set agent_key like "ollama:llama3.1:70b" or "openai:gpt-4o"
+# which maps directly to pydantic-ai model identifiers.
+PYDANTIC_AI_PREFIXES = frozenset(
+    {
+        "ollama",
+        "openai",
+        "groq",
+        "anthropic",
+        "google",
+        "lmstudio",
+        "openrouter",
+        "custom",
+    }
+)
+
+# Default base URLs for local model providers and OpenRouter
+DEFAULT_BASE_URLS: dict[str, str] = {
+    "ollama": "http://localhost:11434/v1",
+    "lmstudio": "http://localhost:1234/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+
+
+# Global semaphores keyed by base URL so all clients pointing at the same
+# inference server (e.g. LM Studio) share one slot, regardless of which
+# session (user chat, trading tick, etc.) holds it.
+_SERVER_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+
+# How often the MCP lifecycle task checks its stdio transports for a dead
+# server between shutdown checks (CORR-332). A killed subprocess never raises
+# out of ``run_mcp_servers()``; it only closes the session's streams.
+MCP_TRANSPORT_POLL_SECONDS = 2.0
+
+
+def _get_server_semaphore(base_url: str) -> asyncio.Semaphore:
+    if base_url not in _SERVER_SEMAPHORES:
+        _SERVER_SEMAPHORES[base_url] = asyncio.Semaphore(1)
+    return _SERVER_SEMAPHORES[base_url]
+
+
+def model_prefix(agent_key: str) -> str:
+    """Provider prefix of an agent key, with any endpoint name stripped.
+
+    Custom endpoints carry their saved nickname in the prefix
+    (``custom@venice:llama-3.3-70b``) so that the model id — which may itself
+    contain colons and slashes — stays recoverable with a single partition.
+    """
+    prefix = agent_key.split(":", 1)[0] if ":" in agent_key else ""
+    return prefix.split("@", 1)[0]
+
+
+def is_pydantic_ai_model(agent_key: str) -> bool:
+    """Check if an agent_key should use the PydanticAI client."""
+    return model_prefix(agent_key) in PYDANTIC_AI_PREFIXES
+
+
+def resolve_base_url(model_name: str, base_url: str | None = None) -> str | None:
+    """Return the OpenAI-compatible base URL a model would use.
+
+    Returns ``base_url`` when given, else the provider default (ollama/lmstudio/
+    openrouter). ``None`` for cloud providers pydantic-ai resolves natively
+    (anthropic, groq, default openai/google).
+    """
+    if base_url:
+        return base_url
+    prefix = model_name.split(":", 1)[0]
+    return DEFAULT_BASE_URLS.get(prefix)
+
+
+async def healthcheck_local_backend(
+    model_name: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> str | None:
+    """Preflight an OpenAI-compatible backend with a known base URL before a run.
+
+    Covers ollama / lmstudio, openai:* with a custom base_url, and custom
+    endpoints (``custom@<endpoint>:<model>``) — anything we can point a
+    ``/models`` request at. Verifies the server is reachable and, when a model
+    id is given, that the model is actually served. Returns ``None`` when
+    healthy or when there is nothing to preflight (cloud providers are left to
+    fail with their own formatted error); otherwise a short, human-readable
+    reason string.
+
+    Without this a custom endpoint that is down or has a stale key fails deep
+    inside the run instead of falling back cleanly.
+    """
+    import httpx
+
+    prefix, _, model_id = model_name.partition(":")
+    prefix = prefix.split("@", 1)[0]  # "custom@venice" → "custom"
+    is_checkable = prefix in ("ollama", "lmstudio") or (
+        prefix in ("openai", "custom") and base_url
+    )
+    if not is_checkable:
+        return None
+
+    url = resolve_base_url(model_name, base_url)
+    if not url:
+        return None
+
+    # A custom endpoint usually rejects an unauthenticated /models with 401,
+    # which would look like a dead backend rather than a working one.
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    models_url = f"{url.rstrip('/')}/models"
+    try:
+        timeout = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(models_url, headers=headers)
+    except Exception as e:
+        server = "endpoint" if prefix == "custom" else f"{prefix} server"
+        return (
+            f"the model backend at {url} is unreachable ({type(e).__name__}) — "
+            f"is the {server} running?"
+        )
+
+    if resp.status_code in (401, 403):
+        return (
+            f"the endpoint at {url} rejected the API key " f"(HTTP {resp.status_code})."
+        )
+    if resp.status_code != 200:
+        return f"the model backend at {url} returned HTTP {resp.status_code}."
+
+    if model_id:
+        try:
+            ids = {
+                m.get("id") for m in resp.json().get("data", []) if isinstance(m, dict)
+            }
+        except Exception:
+            ids = set()
+        ids = {i for i in ids if isinstance(i, str) and i}
+        # Ollama reports ids like "qwen3:32b"; match exact or tag-prefix.
+        loaded = any(i == model_id or i.startswith(f"{model_id}:") for i in ids)
+        if ids and not loaded:
+            # A hosted endpoint can list hundreds of models — don't paste them
+            # all into a Telegram message.
+            shown = sorted(ids)
+            available = ", ".join(shown[:10]) or "(none)"
+            if len(shown) > 10:
+                available += f", ... (+{len(shown) - 10} more)"
+            return (
+                f"model '{model_id}' is not served by the backend at {url}. "
+                f"Available: {available}."
+            )
+
+    return None
+
+
+_NULL_SAFE_MODEL_CLS: Any = None
+
+
+def _make_openai_compat_model(model_id: str, provider: Any) -> Any:
+    """Build an OpenAIModel that never sends an assistant ``content: null``.
+
+    Ollama's OpenAI-compatible ``/v1/chat/completions`` endpoint rejects any
+    message whose ``content`` is null with ``invalid message content type:
+    <nil>``. pydantic-ai serializes an assistant turn that is *only* tool calls
+    (no accompanying text) with ``content=None`` — which happens routinely the
+    moment a model decides to call a tool without narrating first. Coerce those
+    nulls to an empty string so strict local backends (Ollama, some LM Studio /
+    vLLM builds) accept the follow-up request inside a multi-step tool run.
+
+    The subclass is defined lazily and cached so the heavy pydantic-ai import
+    only happens when a model is actually built.
+    """
+    global _NULL_SAFE_MODEL_CLS
+    if _NULL_SAFE_MODEL_CLS is None:
+        from pydantic_ai.models.openai import OpenAIModel
+
+        class _NullContentSafeOpenAIModel(OpenAIModel):
+            async def _map_messages(self, *args: Any, **kwargs: Any) -> Any:
+                mapped = await super()._map_messages(*args, **kwargs)
+                for msg in mapped:
+                    if (
+                        isinstance(msg, dict)
+                        and msg.get("role") == "assistant"
+                        and msg.get("content") is None
+                    ):
+                        msg["content"] = ""
+                return mapped
+
+        _NULL_SAFE_MODEL_CLS = _NullContentSafeOpenAIModel
+
+    return _NULL_SAFE_MODEL_CLS(model_id, provider=provider)
+
+
+def _tool_args_to_dict(args: Any) -> dict | None:
+    """Normalise a pydantic-ai tool-call `args` value to a dict.
+
+    OpenAI-compatible providers (LM Studio, Ollama, OpenRouter) deliver tool-call
+    arguments as a JSON string rather than a dict, so a bare isinstance(dict)
+    check would drop them. Parse the string form too.
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str) and args.strip():
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+REFUSAL_PREFIX = "PERMISSION DENIED"
+
+
+def _refusal_text(tool_name: str, reason: str) -> str:
+    """The tool result a blocked call gets instead of running."""
+    detail = f": {reason}" if reason else ""
+    return (
+        f"{REFUSAL_PREFIX}: `{tool_name}` was blocked by the permission gate"
+        f"{detail}. The call did NOT execute and nothing changed. This is the "
+        f"guard deciding, not a human approval that never arrived: do not retry "
+        f"the same call and do not wait for anyone. Report the refusal, and act "
+        f"on the reason — a different size, a different action, or none."
+    )
+
+
+class PermissionGate:
+    """Records the permission decision for every tool call before it runs.
+
+    ``prompt_stream`` observes a ``CallToolsNode`` *before* pydantic-graph
+    executes it (``pydantic_graph`` returns the node on one ``__anext__`` and
+    runs it on the next), so the decision for a call is always recorded ahead of
+    the ``call_tool`` that would execute it. The gated toolset then consumes
+    that decision at the point of execution.
+
+    The gate **fails closed**: only an explicitly recorded allow lets a call
+    through. A call that was never seen, one whose permission check raised, and
+    a replayed ``tool_call_id`` whose decision was already consumed are all
+    refused (SEC-080).
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[dict[str, Any]] = []
+
+    def reset(self) -> None:
+        """Drop decisions from a previous turn."""
+        self._pending.clear()
+
+    def record(
+        self,
+        tool_call_id: str | None,
+        tool_name: str,
+        allowed: bool,
+        reason: str = "",
+    ) -> None:
+        self._pending.append(
+            {
+                "id": (tool_call_id or "").strip(),
+                "name": tool_name,
+                "allowed": allowed,
+                "reason": reason,
+                "used": False,
+            }
+        )
+
+    def consume(self, tool_call_id: str | None, tool_name: str) -> tuple[bool, str]:
+        """Take the decision for this call. Unknown calls are refused."""
+        call_id = (tool_call_id or "").strip()
+        if call_id:
+            for entry in self._pending:
+                if not entry["used"] and entry["id"] == call_id:
+                    entry["used"] = True
+                    return entry["allowed"], entry["reason"]
+        # Providers that omit tool_call_ids still need matching; fall back to
+        # the first undecided call of the same name, in emission order.
+        for entry in self._pending:
+            if not entry["used"] and entry["name"] == tool_name:
+                entry["used"] = True
+                return entry["allowed"], entry["reason"]
+        return False, "no permission decision was recorded for this call"
+
+
+_GATED_TOOLSET_CLS: Any = None
+
+
+def gated_toolset_cls() -> Any:
+    """The ``WrapperToolset`` subclass that enforces a ``PermissionGate``.
+
+    Built lazily and cached: importing this module must not require pydantic-ai,
+    which is why every other pydantic-ai import here is deferred too.
+    """
+    global _GATED_TOOLSET_CLS
+    if _GATED_TOOLSET_CLS is not None:
+        return _GATED_TOOLSET_CLS
+
+    from dataclasses import dataclass
+
+    from pydantic_ai.toolsets import WrapperToolset
+
+    @dataclass
+    class PermissionGatedToolset(WrapperToolset):
+        """Refuses a tool call the gate did not explicitly allow.
+
+        This is where a denial becomes real. The refusal is returned as the
+        tool's result (rather than raised) so the run stays well-formed and the
+        model is told, in-band, that the call was refused.
+        """
+
+        gate: PermissionGate | None = None
+
+        async def call_tool(
+            self, name: str, tool_args: dict, ctx: Any, tool: Any
+        ) -> Any:
+            gate = self.gate
+            if gate is None:
+                # A gated toolset without a gate is a wiring bug; refuse rather
+                # than silently running an unchecked call.
+                log.error("Permission gate missing for tool %s — refusing", name)
+                return _refusal_text(name, "permission gate unavailable")
+
+            allowed, reason = gate.consume(getattr(ctx, "tool_call_id", None), name)
+            if not allowed:
+                log.warning("Blocked tool call %s: %s", name, reason or "denied")
+                return _refusal_text(name, reason)
+            return await self.wrapped.call_tool(name, tool_args, ctx, tool)
+
+    _GATED_TOOLSET_CLS = PermissionGatedToolset
+    return _GATED_TOOLSET_CLS
+
+
+def _dead_transport(servers: list[Any]) -> str | None:
+    """Label of the first MCP server whose session streams are closed, if any.
+
+    When an MCP subprocess dies, the stdio reader hits EOF and the MCP
+    session's receive loop closes both of its streams. Nothing raises until
+    the next request (``anyio.ClosedResourceError``), so a closed stream is
+    the only signal there is (CORR-332). ``_closed`` is anyio's memory-stream
+    flag; a server that has not opened its streams reads as healthy.
+    """
+    for server in servers:
+        for attr in ("_read_stream", "_write_stream"):
+            stream = getattr(server, attr, None)
+            if stream is not None and getattr(stream, "_closed", False):
+                return getattr(server, "command", None) or repr(server)
+    return None
+
+
+class PydanticAIClient:
+    """Manages a pydantic-ai agent with MCP tool servers.
+
+    Mirrors ACPClient's interface: start() → prompt_stream() → stop().
+    MCP servers are launched as stdio subprocesses, same as ACP does,
+    but tools are consumed via pydantic-ai's MCPServerStdio integration.
+
+    Model resolution:
+      - "ollama:llama3.1"  → uses ollama provider (localhost:11434)
+      - "openai:gpt-4o"    → uses OpenAI API
+      - "openai:my-model"  → with base_url, uses any OpenAI-compatible API (LM Studio, vLLM, etc.)
+      - "groq:llama-3.3-70b-versatile" → uses Groq cloud
+      - "anthropic:claude-sonnet-4-6" → uses Anthropic API
+      - "openrouter:anthropic/claude-sonnet-4-5" → uses OpenRouter (requires OPENROUTER_API_KEY)
+      - "custom@venice:llama-3.3-70b" → any OpenAI-compatible API (Venice AI,
+        Together, a local vLLM, ...). The "@venice" segment names one of the
+        user's saved endpoints; base_url and api_key are resolved from it by
+        ``condor.preferences.resolve_custom_endpoint``, with CUSTOM_LLM_* env
+        vars as fallback.
+        The bare "custom:<model-id>" form (no endpoint name) is still accepted
+        for configs written before endpoints were nameable.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        permission_callback: PermissionCallback | None = None,
+        extra_env: dict[str, str] | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        allowed_tools: (
+            list[str] | None
+        ) = None,  # restrict the agent to these tool names
+        system_prompt: str = "",
+    ):
+        self.model_name = model
+        self.mcp_server_configs = mcp_servers or []
+        self.permission_callback = permission_callback
+        self.extra_env = extra_env
+        self.base_url = base_url
+        self.api_key = api_key
+        # Who the model is told it is, delivered at system level as pydantic-ai
+        # ``instructions``. The twin of ACPClient's ``_meta.systemPrompt.append``
+        # (client.py): without it a bound Agent answers as the host instead of
+        # as itself, and the weaker channels do not fix that (FEAT-025).
+        self.system_prompt = system_prompt
+        # When set, the agent only sees tools whose name is in this allowlist
+        # (used by delegated domain agents to scope an agent to one domain).
+        self.allowed_tools = set(allowed_tools) if allowed_tools else None
+        self._mcp_servers: list[Any] = []
+        self._agent: Any = None
+        # Carries each tool call's permission decision from prompt_stream (where
+        # it is taken) to the toolset (where the call would run). SEC-080.
+        self._permission_gate = PermissionGate()
+        # Resolved in start() to the global semaphore for this server's base URL,
+        # so all sessions sharing the same local inference server (e.g. LM Studio)
+        # are serialized. Stays None for natively-resolved cloud providers
+        # (anthropic/groq/default openai/google), which handle concurrency fine.
+        self._request_semaphore: asyncio.Semaphore | None = None
+        # Whether *this* client currently owns a permit of that semaphore. The
+        # slot changes hands twice per confirmation (released for the human
+        # wait, re-acquired after), and a cancellation can land in either gap —
+        # so ownership is tracked explicitly rather than inferred from nesting,
+        # and only the owner ever releases (CORR-330).
+        self._slot_held = False
+        # Background task that owns the MCP server cancel scopes.
+        # anyio requires cancel scopes to be entered/exited in the same task,
+        # so we can't close them from an arbitrary caller task.
+        self._mcp_task: asyncio.Task | None = None
+        self._ready_event: asyncio.Event | None = None
+        self._shutdown_event: asyncio.Event | None = None
+        self._startup_error: BaseException | None = None
+        # Set when the MCP context collapses *after* startup; the agent is
+        # dropped alongside it so ``alive`` reports False (CORR-332).
+        self._lifecycle_error: BaseException | None = None
+        # Accumulated turn history — grows with each prompt_stream() call so
+        # the model sees prior turns. A fresh client is created per session/tick,
+        # so history is reset by recreating the client rather than in-place.
+        self._message_history: list = []
+        # Set by abort_prompt(); the node loop reads it between graph steps.
+        # There is no protocol to notify here (the "agent" is a library call),
+        # so cancelling the run *is* the cancel.
+        self._abort_requested = False
+        # Everything this client's runs have read and written, for its whole
+        # life (FEAT-120). The session takes per-turn deltas of it; nothing
+        # here knows what a turn is.
+        self.usage = TokenUsage()
+
+    async def _build_model(self) -> Any:
+        """Build the pydantic-ai model object with sensible defaults.
+
+        Async because a bare local key ("ollama:" / "lmstudio:") has to ask the
+        local backend which model it serves, and that probe must not park the
+        one event loop that also runs Telegram polling, the dashboard and every
+        other session.
+
+        All local providers (ollama, lmstudio) are routed through OpenAI-compatible
+        endpoints so we control the base_url explicitly. This avoids requiring
+        environment variables like OLLAMA_BASE_URL.
+
+        Resolution:
+          - ollama:model     → OpenAI-compat at localhost:11434/v1 (or custom base_url)
+          - lmstudio:model   → OpenAI-compat at localhost:1234/v1 (or custom base_url)
+          - openrouter:model → OpenAI-compat at https://openrouter.ai/api/v1,
+                               requires OPENROUTER_API_KEY; model id must be
+                               explicit (e.g. "openrouter:anthropic/claude-sonnet-4-5").
+          - openai:model     → OpenAI API (or custom base_url for vLLM, etc.)
+          - groq/anthropic   → standard pydantic-ai resolution
+        """
+        import httpx
+        from openai import AsyncOpenAI
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        prefix, _, model_id = self.model_name.partition(":")
+        prefix = prefix.split("@", 1)[0]  # "custom@venice" → "custom"
+        base_url = self.base_url
+
+        # The OpenAI SDK applies its own default timeout (connect=5s) that takes
+        # precedence over any httpx.AsyncClient timeout. Set it on AsyncOpenAI
+        # directly so it actually applies. connect=30s handles a busy LM Studio
+        # connection pool; the read timeout covers slow local model generation —
+        # including a cold first request where the model is still loading into
+        # memory. Default 600s; override via LOCAL_MODEL_READ_TIMEOUT.
+        _read_timeout = float(os.environ.get("LOCAL_MODEL_READ_TIMEOUT", "600"))
+        _local_timeout = httpx.Timeout(
+            connect=30.0, read=_read_timeout, write=30.0, pool=30.0
+        )
+
+        # OpenRouter: OpenAI-compatible cloud gateway, requires API key.
+        # Handled before the generic DEFAULT_BASE_URLS branch because that branch
+        # uses api_key="not-needed", which OpenRouter rejects.
+        if prefix == "openrouter":
+            if not model_id:
+                raise RuntimeError(
+                    "OpenRouter requires an explicit model id, e.g. "
+                    "'openrouter:openai/gpt-4o' or 'openrouter:anthropic/claude-sonnet-4-5'."
+                )
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "OPENROUTER_API_KEY is not set. Add it to your .env to use openrouter:* models."
+                )
+            openai_client = AsyncOpenAI(
+                base_url=base_url or DEFAULT_BASE_URLS["openrouter"],
+                api_key=api_key,
+                timeout=_local_timeout,
+            )
+            return _make_openai_compat_model(
+                model_id, OpenAIProvider(openai_client=openai_client)
+            )
+
+        # Custom OpenAI-compatible provider (Venice AI, Together, any vLLM/TGI...):
+        # base_url and api_key come from the user's setup flow (stored per-user)
+        # with CUSTOM_LLM_BASE_URL / CUSTOM_LLM_API_KEY env fallbacks.
+        if prefix == "custom":
+            if not model_id:
+                raise RuntimeError(
+                    "Custom provider requires an explicit model id, e.g. "
+                    "'custom@venice:llama-3.3-70b'. Pick one via /agent → "
+                    "Change LLM → Custom endpoint (or Settings → AI Providers "
+                    "on the web dashboard)."
+                )
+            base_url = base_url or os.environ.get("CUSTOM_LLM_BASE_URL")
+            if not base_url:
+                raise RuntimeError(
+                    "No base URL configured for the custom provider. Add the "
+                    "endpoint via /agent → Change LLM → Custom endpoint (or "
+                    "Settings → AI Providers on the web dashboard), or set "
+                    "CUSTOM_LLM_BASE_URL."
+                )
+            api_key = (
+                self.api_key or os.environ.get("CUSTOM_LLM_API_KEY") or "not-needed"
+            )
+            openai_client = AsyncOpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=_local_timeout,
+            )
+            return _make_openai_compat_model(
+                model_id, OpenAIProvider(openai_client=openai_client)
+            )
+
+        # Local providers: always use OpenAI-compatible endpoint with default URL
+        if prefix in DEFAULT_BASE_URLS:
+            base_url = base_url or DEFAULT_BASE_URLS[prefix]
+            if not model_id:
+                model_id = await self._resolve_default_local_model(
+                    prefix=prefix, base_url=base_url
+                )
+            openai_client = AsyncOpenAI(
+                base_url=base_url,
+                api_key="not-needed",
+                timeout=_local_timeout,
+            )
+            return _make_openai_compat_model(
+                model_id, OpenAIProvider(openai_client=openai_client)
+            )
+
+        # OpenAI with custom base_url (vLLM, TGI, etc.)
+        if prefix == "openai" and base_url:
+            openai_client = AsyncOpenAI(
+                base_url=base_url,
+                api_key="not-needed",
+                timeout=_local_timeout,
+            )
+            return _make_openai_compat_model(
+                model_id, OpenAIProvider(openai_client=openai_client)
+            )
+
+        # Standard pydantic-ai resolution (openai, groq, anthropic, google)
+        from pydantic_ai.models import infer_model
+
+        return infer_model(self.model_name)
+
+    async def _resolve_default_local_model(self, prefix: str, base_url: str) -> str:
+        """Resolve a usable default model for local providers.
+
+        For ollama/lmstudio with model strings like "ollama:" (no explicit model),
+        prefer an env override and then probe known model-list endpoints.
+        """
+        env_override = os.environ.get("CONDOR_DEFAULT_LOCAL_MODEL") or os.environ.get(
+            "OLLAMA_MODEL"
+        )
+        if env_override:
+            return env_override
+
+        model_id = await self._fetch_openai_compatible_model(base_url)
+        if model_id:
+            return model_id
+
+        if prefix == "ollama":
+            model_id = await self._fetch_ollama_native_model(base_url)
+            if model_id:
+                return model_id
+
+        raise RuntimeError(
+            f"No local model found for '{prefix}'. "
+            f"Use an explicit key like '{prefix}:<model-name>' (e.g. ollama:llama3.1) "
+            "or set CONDOR_DEFAULT_LOCAL_MODEL."
+        )
+
+    async def _probe_json(self, url: str) -> Any:
+        """GET ``url`` off the event loop and return the decoded JSON, or None.
+
+        Uses the same async client ``healthcheck_local_backend`` uses. The old
+        stdlib ``urlopen`` here was synchronous, so a local backend that was
+        down or hung froze the single loop that also runs Telegram polling, the
+        dashboard and every other session for the whole timeout (PERF-331).
+        """
+        import httpx
+
+        from condor.runtime.timeouts import TIMEOUTS
+
+        budget = TIMEOUTS.local_model_probe
+        timeout = httpx.Timeout(connect=budget, read=budget, write=budget, pool=budget)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            return None
+
+    async def _fetch_openai_compatible_model(self, base_url: str) -> str | None:
+        """Try GET {base_url}/models and return the first model id."""
+        url = f"{base_url.rstrip('/')}/models"
+        payload = await self._probe_json(url)
+        if not isinstance(payload, dict):
+            return None
+
+        data = payload.get("data")
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                model_id = first.get("id")
+                if isinstance(model_id, str) and model_id.strip():
+                    return model_id.strip()
+        return None
+
+    async def _fetch_ollama_native_model(self, base_url: str) -> str | None:
+        """Try GET /api/tags from the Ollama host and return first model name."""
+        parsed = urlparse(base_url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        native_url = f"{parsed.scheme}://{parsed.netloc}/api/tags"
+        payload = await self._probe_json(native_url)
+        if not isinstance(payload, dict):
+            return None
+
+        models = payload.get("models")
+        if isinstance(models, list) and models:
+            first = models[0]
+            if isinstance(first, dict):
+                name = first.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        return None
+
+    async def start(self) -> None:
+        """Initialize MCP servers and create the pydantic-ai agent."""
+        from pydantic_ai import Agent
+        from pydantic_ai.mcp import MCPServerStdio
+
+        toolsets = []
+        for srv_config in self.mcp_server_configs:
+            command = srv_config["command"]
+            # StdioServerParameters requires list[str]; YAML/config may yield ints
+            # (e.g. numeric hummingbot passwords) that only surface with pydantic-ai
+            # backends (lmstudio:/ollama:/openrouter:), not ACP agents.
+            args = [str(a) for a in srv_config.get("args", [])]
+
+            # Inherit the parent process env (same as ACPClient) so cloud keys
+            # loaded via dotenv — e.g. OPENROUTER_API_KEY — reach MCP tools like
+            # get_available_models. extra_env / per-server env overlay on top.
+            env = {k: str(v) for k, v in os.environ.items()}
+            if self.extra_env:
+                env.update({k: str(v) for k, v in self.extra_env.items()})
+            for env_entry in srv_config.get("env", []):
+                if isinstance(env_entry, dict):
+                    env[str(env_entry["name"])] = str(env_entry["value"])
+
+            mcp_server = MCPServerStdio(
+                command,
+                args=args,
+                env=env,
+                timeout=30,
+                # pydantic-ai drops a server's ``instructions`` by default; the
+                # ACP host forwards them, so ask for them here too or the condor
+                # server's routing rules never reach a pydantic-ai model.
+                include_instructions=True,
+            )
+
+            toolsets.append(mcp_server)
+            self._mcp_servers.append(mcp_server)
+
+        model = await self._build_model()
+        prepare = self._prepare_tools if self.allowed_tools else None
+        self._agent = Agent(
+            model,
+            instructions=self.system_prompt or None,
+            toolsets=self._gate_toolsets(toolsets),
+            prepare_tools=prepare,
+        )
+
+        # Resolve the global semaphore for this server's base URL so all client
+        # instances targeting the same local inference server share one request
+        # slot. Cloud providers pydantic-ai resolves natively (anthropic, groq,
+        # default openai/google) have no base URL here; they handle concurrency
+        # fine, so we leave the semaphore None and skip serialization for them.
+        resolved_base_url = resolve_base_url(self.model_name, self.base_url)
+        self._request_semaphore = (
+            _get_server_semaphore(resolved_base_url)
+            if resolved_base_url is not None
+            else None
+        )
+
+        # Spin up a dedicated background task to own the MCP server cancel scopes.
+        # anyio cancel scopes must be entered and exited in the same asyncio task;
+        # using a shared AsyncExitStack across tasks causes RuntimeError on teardown.
+        self._ready_event = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
+        self._startup_error = None
+        self._lifecycle_error = None
+        self._mcp_task = asyncio.create_task(self._run_mcp_lifecycle())
+
+        await self._await_ready()
+
+        log.info(
+            "PydanticAI client ready: model=%s, mcp_servers=%d",
+            self.model_name,
+            len(self._mcp_servers),
+        )
+
+    async def _await_ready(self) -> None:
+        """Wait for the MCP lifecycle task to come up, under a deadline.
+
+        The wait used to be a bare ``self._ready_event.wait()`` -- the same
+        unbounded shape as the ACP handshake, with the same failure: an MCP
+        stdio server that spawns and never finishes its own init parks
+        ``start()`` forever, and with it the per-key session-creation lock the
+        caller holds (CORR-333). On expiry the lifecycle task is cancelled so
+        no MCP subprocess is left behind, and the client is left visibly dead.
+        """
+        from condor.runtime.timeouts import TIMEOUTS
+
+        try:
+            await asyncio.wait_for(
+                self._ready_event.wait(), timeout=TIMEOUTS.agent_handshake
+            )
+        except asyncio.TimeoutError:
+            task, self._mcp_task = self._mcp_task, None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            self._mcp_servers.clear()
+            self._agent = None
+            raise TimeoutError(
+                f"MCP servers for {self.model_name} did not become ready within "
+                f"{TIMEOUTS.agent_handshake}s; the agent was not started."
+            ) from None
+
+        if self._startup_error is not None:
+            self._mcp_task = None
+            self._mcp_servers.clear()
+            self._agent = None
+            raise self._startup_error
+
+    def _gate_toolsets(self, toolsets: list) -> list:
+        """Wrap toolsets so a denied call never reaches the tool (SEC-080).
+
+        Only wraps when a ``permission_callback`` exists: with no callback there
+        is no decision to enforce, and a gate would refuse everything. Composes
+        with ``_prepare_tools``, which filters tool *definitions* and never sees
+        the toolset objects.
+        """
+        if self.permission_callback is None:
+            return toolsets
+        cls = gated_toolset_cls()
+        return [cls(ts, self._permission_gate) for ts in toolsets]
+
+    async def _prepare_tools(self, ctx: Any, tool_defs: list) -> list:
+        """Filter tools to ``self.allowed_tools`` before each run.
+
+        pydantic-ai calls this with the full ``list[ToolDefinition]`` discovered
+        from all MCP servers; we keep only those whose name is allowlisted. Tool
+        names may be namespaced by the MCP layer (e.g. ``mcp__condor__manage_skill``),
+        so we match on either the full name or its last ``__``-delimited segment.
+        """
+        allowed = self.allowed_tools or set()
+
+        def _ok(name: str) -> bool:
+            return name in allowed or name.rsplit("__", 1)[-1] in allowed
+
+        kept = [td for td in tool_defs if _ok(td.name)]
+        dropped = len(tool_defs) - len(kept)
+        if dropped:
+            log.debug(
+                "Tool allowlist: kept %d/%d tools (%s)",
+                len(kept),
+                len(tool_defs),
+                ", ".join(sorted(allowed)),
+            )
+        return kept
+
+    async def _run_mcp_lifecycle(self) -> None:
+        """Background task that holds the MCP server context open.
+
+        A failure *before* ready is handed to ``start()`` through
+        ``_startup_error``. A failure *after* ready means an MCP server died
+        under us (subprocess crash, host restart, OOM): log it and tear the
+        agent down so ``alive`` reports False and the session layer builds a
+        fresh client, instead of quietly handing prompts to a toolless one
+        (CORR-332). ``CancelledError`` is never converted into a normal return.
+        """
+        servers = list(self._mcp_servers)
+        try:
+            async with self._agent.run_mcp_servers():
+                self._ready_event.set()
+                while not self._shutdown_event.is_set():
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=MCP_TRANSPORT_POLL_SECONDS,
+                        )
+                    dead = _dead_transport(servers)
+                    if dead is not None and not self._shutdown_event.is_set():
+                        raise ConnectionError(f"MCP server transport closed: {dead}")
+        except asyncio.CancelledError as exc:
+            # Unblock start() if we were cancelled before ready, then stay
+            # visibly cancelled rather than completing "successfully".
+            if not self._ready_event.is_set():
+                self._startup_error = exc
+                self._ready_event.set()
+            else:
+                self._lifecycle_error = exc
+                self._teardown_after_lifecycle_failure()
+            raise
+        except BaseException as exc:
+            if not self._ready_event.is_set():
+                self._startup_error = exc
+                self._ready_event.set()
+                return
+            if self._lifecycle_error is None:
+                # Not already reported by a prompt that hit the dead transport.
+                log.exception(
+                    "MCP server lifecycle failed after startup (model=%s); "
+                    "marking client dead so a new one is built",
+                    self.model_name,
+                )
+                self._lifecycle_error = exc
+            self._teardown_after_lifecycle_failure()
+
+    def _mark_dead_if_transport_closed(self, exc: BaseException) -> None:
+        """A turn failed: if an MCP transport is gone, the client is dead.
+
+        The prompt usually meets a killed subprocess before the lifecycle
+        task's next poll does, so don't leave ``alive`` True in between. The
+        lifecycle task still exits on its next poll and closes the servers.
+        """
+        dead = _dead_transport(self._mcp_servers)
+        if dead is None or self._lifecycle_error is not None:
+            return
+        log.error(
+            "MCP server transport closed mid-session (model=%s, server=%s); "
+            "marking client dead so a new one is built",
+            self.model_name,
+            dead,
+        )
+        self._lifecycle_error = exc
+        self._teardown_after_lifecycle_failure()
+
+    def _teardown_after_lifecycle_failure(self) -> None:
+        """Drop the agent so ``alive`` cannot report a toolless client healthy."""
+        self._agent = None
+        self._mcp_servers.clear()
+
+    async def stop(self) -> None:
+        """Signal the MCP lifecycle task to shut down and wait for it."""
+        if self._mcp_task is not None:
+            self._shutdown_event.set()
+            try:
+                await asyncio.wait_for(self._mcp_task, timeout=10)
+            except asyncio.CancelledError:
+                # The lifecycle task now propagates its own cancellation
+                # (CORR-332). That is its shutdown, not ours -- only re-raise
+                # when it is *this* task being cancelled.
+                if not self._mcp_task.cancelled():
+                    raise
+                log.warning("MCP server task was cancelled during shutdown")
+            except Exception:
+                log.exception("Error stopping MCP server task")
+                self._mcp_task.cancel()
+            self._mcp_task = None
+        self._mcp_servers.clear()
+        self._agent = None
+
+    @property
+    def alive(self) -> bool:
+        return self._agent is not None
+
+    @contextlib.asynccontextmanager
+    async def _hold_request_slot(self) -> AsyncIterator[None]:
+        """Hold the per-server request slot for the duration of one turn.
+
+        Deliberately not ``async with sem``: the slot is handed back and taken
+        again mid-turn by :meth:`_release_request_slot`, so a context manager
+        that releases unconditionally on exit would hand back a permit this
+        client no longer owns whenever the turn ends inside that window —
+        permanently widening concurrency against the shared, process-global
+        semaphore. ``_slot_held`` is the single source of truth (CORR-330).
+
+        No-op for cloud providers, whose semaphore is None (PERF-038).
+        """
+        sem = self._request_semaphore
+        if sem is None:
+            yield
+            return
+        await sem.acquire()
+        self._slot_held = True
+        try:
+            yield
+        finally:
+            if self._slot_held:
+                self._slot_held = False
+                sem.release()
+
+    @contextlib.asynccontextmanager
+    async def _release_request_slot(self) -> AsyncIterator[None]:
+        """Temporarily release the per-server request slot for a blocking wait.
+
+        The per-server semaphore exists only to serialize concurrent HTTP
+        requests to single-threaded local backends (LM Studio/Ollama). It must
+        NOT stay held while we block on a human-in-the-loop confirmation: the
+        semaphore is GLOBAL and keyed by base URL, so one user sitting on a
+        permission dialog would otherwise stall every other session/tick that
+        targets the same backend for the whole confirmation timeout.
+
+        Releases the slot on entry and re-acquires it before returning, so model
+        HTTP work stays serialized. No-op for cloud providers, whose semaphore is
+        None (PERF-038).
+
+        When the wait is *cancelled* the slot is deliberately not re-acquired
+        (CORR-330). Web Stop cancels the prompt task outright, which lands in
+        this window by construction; queueing for a slot we would immediately
+        hand back would park the turn's teardown — and the session lock it
+        carries — behind another session's inference. ``_slot_held`` stays
+        False so :meth:`_hold_request_slot` skips a release it does not own.
+        """
+        sem = self._request_semaphore
+        if sem is None:
+            yield
+            return
+        self._slot_held = False
+        sem.release()
+        cancelled = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if not cancelled:
+                # A cancellation landing here instead raises out of acquire()
+                # without taking a permit, leaving _slot_held False — which is
+                # exactly the state the outer guard needs to stay balanced.
+                await sem.acquire()
+                self._slot_held = True
+
+    async def prompt(self, text: str) -> str:
+        """One-shot prompt: send text, return response."""
+        chunks: list[str] = []
+        async for event in self.prompt_stream(text):
+            if isinstance(event, TextChunk):
+                chunks.append(event.text)
+        return "".join(chunks)
+
+    async def abort_prompt(self) -> None:
+        """Stop the in-flight run at the next graph step.
+
+        The ACP counterpart notifies the agent over the wire; here the run is a
+        library call, so the flag the node loop checks is the whole mechanism.
+        A step already in flight (a model call, a tool) still finishes — but the
+        partial turn is committed to the history either way, so the model's
+        context ends where the user's screen did.
+        """
+        self._abort_requested = True
+
+    async def prompt_stream(
+        self, text: str, *, images: list | None = None
+    ) -> AsyncIterator[ACPEvent]:
+        """Send a prompt and yield ACPEvents as they arrive.
+
+        Uses pydantic-ai's streaming run with MCP tools.
+        Tool calls go through the permission callback for risk checking.
+        MCP servers are already running (started in start()), so we
+        call iter() directly without run_mcp_servers().
+
+        ``images`` become ``BinaryContent`` parts ahead of the text, the same
+        order the ACP path uses. Forwarded optimistically: unlike ACP there is
+        nothing here to introspect for a vision capability, and guessing from a
+        hardcoded list of model ids is a maintenance burden that would go stale
+        faster than the providers ship. A model that cannot see says so in its
+        own error, which reaches the user as the turn's error (FEAT-098).
+        """
+        assert self._agent is not None, "Client not started"
+
+        # Serialize requests: local inference servers (LM Studio, Ollama) process
+        # one request at a time. Without this, concurrent ticks race to connect
+        # and the losing ticks ConnectTimeout against a busy server. Cloud
+        # providers leave the semaphore None (see start()) so concurrent prompts
+        # run in parallel; the guard is a no-op for them.
+        async with self._hold_request_slot():
+            start_time = time.monotonic()
+            self._abort_requested = False
+            aborted = False
+
+            try:
+                from pydantic_ai.agent import CallToolsNode, ModelRequestNode
+                from pydantic_graph import End
+
+                self._permission_gate.reset()
+                # tool_call_ids we refused: their synthetic refusal result must
+                # not be projected as a "completed" update over the "blocked"
+                # event the dashboard already received.
+                blocked_ids: set[str] = set()
+
+                async with (
+                    self._agent.iter(
+                        self._build_user_prompt(text, images),
+                        message_history=self._message_history,
+                    ) as run,
+                    self._usage_counted(run),
+                ):
+                    async for node in run:
+                        if self._abort_requested:
+                            aborted = True
+                            break
+
+                        if isinstance(node, End):
+                            # Final result -- extract text from the result
+                            if hasattr(node, "data") and node.data:
+                                result_data = node.data
+                                if hasattr(result_data, "data"):
+                                    yield TextChunk(text=str(result_data.data))
+                            break
+
+                        if isinstance(node, ModelRequestNode):
+                            elapsed = time.monotonic() - start_time
+                            yield Heartbeat(elapsed_seconds=elapsed)
+                            for event in self._tool_return_events(node, blocked_ids):
+                                yield event
+
+                        elif isinstance(node, CallToolsNode):
+                            async for event in self._response_events(node, blocked_ids):
+                                yield event
+
+                    # Accumulate messages so the next prompt_stream() call sees
+                    # this turn's context via message_history. An aborted run
+                    # has no result, but its partial turn must land here too:
+                    # skipping it is what makes the model answer the follow-up
+                    # as though it had finished a turn the user never saw.
+                    if run.result is not None:
+                        self._message_history.extend(run.result.new_messages())
+                    elif aborted:
+                        self._message_history.extend(run.new_messages())
+
+                yield PromptDone(stop_reason="cancelled" if aborted else "end_turn")
+
+            except asyncio.TimeoutError:
+                yield PromptDone(stop_reason="timeout")
+            except Exception as e:
+                log.exception("PydanticAI prompt error: %s", e)
+                self._mark_dead_if_transport_closed(e)
+                yield TextChunk(text=self._format_error(e))
+                yield PromptDone(stop_reason="error")
+
+    @contextlib.asynccontextmanager
+    async def _usage_counted(self, run: Any) -> AsyncIterator[None]:
+        """Count the run's usage however its block is left.
+
+        On the way out of the run, not beside the history accumulation: a
+        finished run, a stopped one and one that raised all spent their
+        requests, and so does one whose consumer walked away mid-answer (a WS
+        drop, a page reload), which closes this generator at a ``yield`` and
+        never reaches the lines after the node loop. The run is still open
+        here, so ``PromptDone`` — yielded after this exits — already sees the
+        turn's tokens.
+        """
+        try:
+            yield
+        finally:
+            self._fold_usage(run)
+
+    def _fold_usage(self, run: Any) -> None:
+        """Add one run's tokens, price and context reading to :attr:`usage`.
+
+        pydantic-ai's ``input_tokens`` is already inclusive of cache, which is
+        the shape :class:`TokenUsage` stores, so the counters go in unconverted.
+
+        The price is all or nothing per run: one response the bundled
+        ``genai_prices`` table cannot price (every local model, a brand-new
+        id) makes the run's cost unknown rather than understated, and it is
+        counted in ``unpriced_turns`` instead.
+
+        Never raises: accounting must not cost the user their answer.
+        """
+        try:
+            from pydantic_ai.messages import ModelResponse
+
+            ru = run.usage()
+            new_messages = (
+                run.result.new_messages()
+                if run.result is not None
+                else run.new_messages()
+            )
+            responses = [m for m in new_messages if isinstance(m, ModelResponse)]
+            cost = 0.0
+            priced = True
+            for response in responses:
+                try:
+                    cost += float(response.cost().total_price)
+                except Exception:  # noqa: BLE001 - LookupError, the model_name assert
+                    priced = False
+                    break
+            context_used = None
+            if responses:
+                last = responses[-1].usage
+                context_used = (last.input_tokens + last.output_tokens) or None
+            self.usage = self.usage + TokenUsage(
+                input_tokens=ru.input_tokens,
+                output_tokens=ru.output_tokens,
+                cache_read_tokens=ru.cache_read_tokens,
+                cache_write_tokens=ru.cache_write_tokens,
+                cost_usd=cost if priced else 0.0,
+                unpriced_turns=0 if priced else 1,
+                context_used=context_used,
+                context_size=self._context_size(),
+            )
+        except Exception:  # noqa: BLE001 - see docstring
+            log.warning("Could not count usage for %s", self.model_name, exc_info=True)
+
+    def _context_size(self) -> int | None:
+        """The model's context window, when it is known without a request.
+
+        Only OpenRouter publishes one in a catalog Condor already fetches; a
+        local server or a natively resolved provider reports none, and the
+        readout then shows occupancy without a denominator.
+        """
+        prefix, _, model_id = self.model_name.partition(":")
+        if prefix != "openrouter" or not model_id:
+            return None
+        from condor.llm.openrouter_models import cached_context_length
+
+        return cached_context_length(model_id)
+
+    def _build_user_prompt(self, text: str, images: list | None) -> Any:
+        """Assemble the user turn: images first, then the text.
+
+        Plain text when there are no images, so the common path stays the shape
+        pydantic-ai documents.
+        """
+        if not images:
+            return text
+
+        from pydantic_ai.messages import BinaryContent
+
+        return [
+            *(
+                BinaryContent(data=image.data, media_type=image.mime)
+                for image in images
+            ),
+            text,
+        ]
+
+    def _tool_return_events(
+        self, node: Any, blocked_ids: set[str]
+    ) -> Iterator[ACPEvent]:
+        """Project a model request's tool results as ``completed`` updates.
+
+        A refused call still produces a (synthetic) refusal result on the next
+        request; projecting it would paint "completed" over the "blocked" event
+        the dashboard already has, so ``blocked_ids`` filters those out.
+        """
+        from pydantic_ai.messages import ToolReturnPart
+
+        request = getattr(node, "request", None)
+        if not request:
+            return
+
+        for part in request.parts:
+            if not isinstance(part, ToolReturnPart):
+                continue
+            if (part.tool_call_id or "") in blocked_ids:
+                continue
+            content = part.content
+            yield ToolCallUpdate(
+                tool_call_id=part.tool_call_id or "",
+                status="completed",
+                output=content if isinstance(content, str) else str(content),
+            )
+
+    async def _response_events(
+        self, node: Any, blocked_ids: set[str]
+    ) -> AsyncIterator[ACPEvent]:
+        """Project one model response into text, thought and tool-call events.
+
+        Tool calls are authorized here, one graph step before pydantic-graph
+        executes them; ``blocked_ids`` collects the refused ones so their
+        refusal result is not later reported as a completion.
+        """
+        from pydantic_ai.messages import TextPart, ThinkingPart, ToolCallPart
+
+        for part in node.model_response.parts:
+            if isinstance(part, TextPart) and part.content:
+                yield TextChunk(text=part.content)
+
+            elif isinstance(part, ThinkingPart) and part.content:
+                # Reasoning models (deepseek-r1/qwq via ollama, gpt-oss via
+                # openrouter) return their thinking as a third part type. The
+                # ACP path already translates the same thing from
+                # ``agent_thought_chunk``; without this branch the thinking
+                # stream is silently dropped and the dashboard/Telegram thought
+                # panel stays empty for every pydantic-ai model (ARCH-333).
+                yield ThoughtChunk(text=part.content)
+
+            elif isinstance(part, ToolCallPart):
+                approved = True
+                if self.permission_callback:
+                    approved, _reason = await self._authorize(part)
+                    if not approved and part.tool_call_id:
+                        blocked_ids.add(part.tool_call_id)
+                for event in self._tool_events(part, approved):
+                    yield event
+
+    async def _authorize(self, part: Any) -> tuple[bool, str]:
+        """Decide whether a tool call may run, and record the decision.
+
+        Fail closed: only an explicit "selected" outcome approves the call. A
+        callback that raises, times out or answers in any other shape is a
+        denial, never a pass (SEC-080).
+
+        The decision is recorded on ``self._permission_gate`` *before* this
+        returns, because the tool itself executes on the next graph step, where
+        the gated toolset consumes exactly that record. Moving the record after
+        the caller's event projection would let the tool run undecided.
+
+        Returns ``(approved, reason)``; ``reason`` is empty when approved.
+        """
+        tool_name = part.tool_name
+        # Unparseable args stay None rather than collapsing to {}: the gate
+        # reads that as "unknown" and fails closed, where an empty dict would
+        # have read as a harmless no-argument call (SEC-093).
+        tool_call_info = {
+            "tool": tool_name,
+            "title": tool_name,
+            "input": _tool_args_to_dict(part.args),
+        }
+        options = [
+            {"optionId": "allow", "kind": "allow_once"},
+            {"optionId": "deny", "kind": "deny"},
+        ]
+
+        reason = ""
+        try:
+            # Don't hold the per-server slot while a human decides — release it
+            # for the wait so other sessions/ticks on this backend aren't
+            # blocked (PERF-029).
+            async with self._release_request_slot():
+                result = await self.permission_callback(tool_call_info, options)
+            outcome = result.get("outcome", {}) if isinstance(result, dict) else {}
+            approved = (
+                isinstance(outcome, dict) and outcome.get("outcome") == "selected"
+            )
+            if not approved:
+                # The gate says why when it can (condor.agents.risk attaches a
+                # ``reason``); an agent told only "denied" reads its own refusal
+                # as a missing approval and waits for a human it may not have.
+                given = result.get("reason") if isinstance(result, dict) else ""
+                reason = given or "denied by the risk/confirmation gate"
+        except Exception as exc:
+            log.exception(
+                "Permission check failed for %s — blocking the call", tool_name
+            )
+            approved = False
+            reason = f"permission check failed ({exc})"
+
+        self._permission_gate.record(part.tool_call_id, tool_name, approved, reason)
+        return approved, reason
+
+    def _tool_events(self, part: Any, approved: bool) -> list[ACPEvent]:
+        """Project one tool call into the events the UI shows.
+
+        A refused call gets a single terminal ``blocked`` event; an approved one
+        opens ``in_progress`` and closes ``completed`` right away, with the real
+        output arriving later as the ``ToolReturnPart`` update for the same id.
+        """
+        tool_id = part.tool_call_id or uuid.uuid4().hex[:12]
+        args = _tool_args_to_dict(part.args)
+
+        if not approved:
+            return [
+                ToolCallEvent(
+                    tool_call_id=tool_id,
+                    title=part.tool_name,
+                    status="blocked",
+                    kind="mcp",
+                    input=args,
+                )
+            ]
+
+        return [
+            ToolCallEvent(
+                tool_call_id=tool_id,
+                title=part.tool_name,
+                status="in_progress",
+                kind="mcp",
+                input=args,
+            ),
+            ToolCallUpdate(tool_call_id=tool_id, status="completed"),
+        ]
+
+    def _format_error(self, e: Exception) -> str:
+        """Translate provider HTTP errors into actionable user-facing text.
+
+        Falls back to the raw exception string for anything we don't recognize.
+        """
+        try:
+            from pydantic_ai.exceptions import ModelHTTPError
+        except ImportError:
+            return f"(error: {e})"
+
+        if not isinstance(e, ModelHTTPError):
+            return f"(error: {e})"
+
+        is_openrouter = self.model_name.startswith("openrouter:")
+        status = getattr(e, "status_code", None)
+
+        if is_openrouter and status == 402:
+            return (
+                "OpenRouter rejected the request: insufficient credits.\n\n"
+                "Either top up at https://openrouter.ai/settings/credits, or "
+                "switch to a free model with /agent → Change LLM → OpenRouter "
+                "→ Enter model manually → openrouter/free."
+            )
+        if is_openrouter and status == 401:
+            return (
+                "OpenRouter rejected the API key (401). Check OPENROUTER_API_KEY "
+                "in your .env and confirm the key is on the account that holds your credits."
+            )
+        if is_openrouter and status == 429:
+            return (
+                "OpenRouter rate-limited the request (429). Free models share a "
+                "tighter quota — wait a moment and retry, or switch to a paid model."
+            )
+        if is_openrouter and status and 500 <= status < 600:
+            return (
+                f"OpenRouter upstream error ({status}). The selected provider may "
+                "be down — try again, or switch models with /agent → Change LLM."
+            )
+
+        is_custom = model_prefix(self.model_name) == "custom"
+        if is_custom and status in (401, 403):
+            return (
+                f"The custom provider rejected the API key ({status}). "
+                "Update it via /agent → Change LLM → Custom endpoint, or "
+                "Settings → AI Providers on the web dashboard."
+            )
+        if is_custom and status == 402:
+            return (
+                "The custom provider rejected the request: insufficient credits "
+                "(402). Top up your account with the provider and retry."
+            )
+        if is_custom and status == 429:
+            return (
+                "The custom provider rate-limited the request (429). "
+                "Wait a moment and retry."
+            )
+        if is_custom and status == 404:
+            return (
+                f"The custom provider returned 404 for model "
+                f"'{self.model_name.partition(':')[2]}'. The model may have been "
+                "removed — pick another via /agent → Change LLM → Custom endpoint."
+            )
+        return f"(error: {e})"

@@ -1,0 +1,1035 @@
+"""
+ServerDataService — Unified server-centric data layer for Condor.
+
+Single cache that all consumers (Telegram, Web REST, WebSocket, MCP) read from.
+Subscription-based polling with per-server rate limiting and health tracking.
+
+Architecture:
+    ServerDataService (singleton)
+      _cache: {CacheKey: CacheEntry}
+      _subscriptions: {CacheKey: {subscriber_id: Subscription}}
+      _health: {server_name: ServerHealth}
+      _rate_limiters: {server_name: RateLimiter}
+      _fetch_registry: {ServerDataType: FetchSpec}
+      _poll_task: asyncio.Task (1s tick loop)
+"""
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import partial
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+
+from condor.asyncutil import SingleFlight, TaskSet
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================
+# DATA TYPES
+# ============================================
+
+
+class ServerDataType(Enum):
+    """All data types fetchable from a Hummingbot server."""
+
+    PORTFOLIO = "portfolio"
+    PORTFOLIO_HISTORY = "portfolio_history"
+    PRICES = "prices"
+    POSITIONS = "positions"
+    ACTIVE_ORDERS = "active_orders"
+    TRADING_RULES = "trading_rules"
+    CONNECTORS = "connectors"
+    BOTS_STATUS = "bots_status"
+    #: The controller configs, deploy timestamps and DB performance the
+    #: bots page is enriched with — fetched as one unit so the REST route
+    #: and every WS bots frame render from the same answer.
+    BOTS_ENRICHMENT = "bots_enrichment"
+    EXECUTORS = "executors"
+    BOT_RUNS = "bot_runs"
+    CANDLE_CONNECTORS = "candle_connectors"
+    SERVER_STATUS = "server_status"
+    #: Whether this server serves the shared /performance/history route
+    #: (FEAT-087). A property of the API build, not of any scope.
+    PERF_HISTORY_CAPABILITY = "perf_history_capability"
+    ALL_CONNECTORS = "all_connectors"
+    VENUES = "venues"
+    TICKERS = "tickers"
+    TICKER_POOL = "ticker_pool"
+
+
+@dataclass(frozen=True)
+class DataTypeDefaults:
+    """Default polling interval and cache TTL for a data type."""
+
+    interval: float  # Default polling interval (seconds)
+    ttl: float  # How long cached data is considered valid
+    # Optional per-param TTL override: (param_name, {param_value: ttl}). Some
+    # data types cache variants that go stale at very different rates — a 1D
+    # portfolio-history window is worthless after minutes while a 3M one holds
+    # for hours — and the key params say which variant this is.
+    ttl_by_param: Optional[Tuple[str, Dict[str, float]]] = None
+
+    def ttl_for(self, params: Dict[str, str]) -> float:
+        """TTL for a specific cache key's params."""
+        if not self.ttl_by_param:
+            return self.ttl
+        param_name, table = self.ttl_by_param
+        return table.get(params.get(param_name, ""), self.ttl)
+
+    def interval_for(self, params: Dict[str, str]) -> float:
+        """Default poll cadence for a specific cache key's params.
+
+        Derived from that key's own TTL rather than a second per-param table:
+        polling a variant far more often than its data goes stale is pure
+        waste, and two tables that must agree eventually stop agreeing. The
+        declared ``interval:ttl`` ratio is what carries over, so a variant that
+        stays valid 60x longer is polled 60x less often.
+        """
+        if not self.ttl_by_param or not self.ttl:
+            return self.interval
+        return self.interval * (self.ttl_for(params) / self.ttl)
+
+
+_DEFAULTS: Dict[ServerDataType, DataTypeDefaults] = {
+    ServerDataType.PORTFOLIO: DataTypeDefaults(interval=10, ttl=60),
+    # One entry per range window, each with its own freshness horizon: a 1D
+    # window at 5m candles is stale within minutes, a 3M window at 1d candles
+    # holds for hours. ``interval == ttl`` here, so ``interval_for`` polls each
+    # range exactly at its own TTL instead of refetching the 3M series 60x per
+    # window like the dashboard's old shared 120s loop did.
+    ServerDataType.PORTFOLIO_HISTORY: DataTypeDefaults(
+        interval=120,
+        ttl=120,
+        ttl_by_param=(
+            "range_key",
+            {"1D": 120, "1W": 600, "1M": 3600, "3M": 7200},
+        ),
+    ),
+    ServerDataType.PRICES: DataTypeDefaults(interval=3, ttl=30),
+    ServerDataType.POSITIONS: DataTypeDefaults(interval=10, ttl=60),
+    ServerDataType.ACTIVE_ORDERS: DataTypeDefaults(interval=10, ttl=60),
+    ServerDataType.TRADING_RULES: DataTypeDefaults(interval=300, ttl=600),
+    ServerDataType.CONNECTORS: DataTypeDefaults(interval=300, ttl=600),
+    ServerDataType.BOTS_STATUS: DataTypeDefaults(interval=5, ttl=30),
+    # Enrichment moves far slower than status: a controller config, a deploy
+    # timestamp and a DB performance snapshot do not change between two 5s
+    # frames, and the fetch costs one call per bot. A minute of staleness
+    # buys eleven of every twelve frames a free, warm read.
+    ServerDataType.BOTS_ENRICHMENT: DataTypeDefaults(interval=30, ttl=60),
+    ServerDataType.EXECUTORS: DataTypeDefaults(interval=2, ttl=30),
+    ServerDataType.BOT_RUNS: DataTypeDefaults(interval=30, ttl=120),
+    ServerDataType.CANDLE_CONNECTORS: DataTypeDefaults(interval=300, ttl=600),
+    ServerDataType.SERVER_STATUS: DataTypeDefaults(interval=60, ttl=120),
+    # A capability, not data: the answer changes only when the API image is
+    # rebuilt or pulled, so it is asked about as rarely as anything here and
+    # is deliberately not in the auto-subscribe set — nothing polls it, the
+    # first chart that needs it fetches it and every later one reads the
+    # cache. Half an hour is short enough that a `docker compose pull`
+    # either way is noticed without a restart.
+    ServerDataType.PERF_HISTORY_CAPABILITY: DataTypeDefaults(interval=1800, ttl=1800),
+    ServerDataType.ALL_CONNECTORS: DataTypeDefaults(interval=300, ttl=600),
+    # Venue traits follow the CONNECTORS cadence, not the "chains change ~never"
+    # one: the credentialed connector list is one of the inputs, so the answer
+    # changes the moment a user adds API keys.
+    ServerDataType.VENUES: DataTypeDefaults(interval=300, ttl=600),
+    ServerDataType.TICKERS: DataTypeDefaults(interval=60, ttl=180),
+    # Whole-server ticker pool: one poll feeds every per-connector ticker view and
+    # all currency conversion, so reads never hit the network.
+    ServerDataType.TICKER_POOL: DataTypeDefaults(interval=60, ttl=300),
+}
+
+
+#: Everything computed from an account's credential list. Adding or removing a
+#: key changes all of it at once: CONNECTORS *is* the credentialed list, VENUES
+#: derives its `credentialed` trait from that same list (fetch_venues calls
+#: fetch_available_cex_connectors, condor/fetchers/connectors.py:173), and
+#: PORTFOLIO is the balances of those accounts. VENUES is the one nothing
+#: re-polls — it is not in auto_subscribe_servers' core_types — so forgetting it
+#: here strands the trade panel behind a stale view-only overlay for a full
+#: 600s TTL, in every browser (issue #238).
+CREDENTIAL_DERIVED: Tuple[ServerDataType, ...] = (
+    ServerDataType.CONNECTORS,
+    ServerDataType.VENUES,
+    ServerDataType.PORTFOLIO,
+)
+
+
+# ============================================
+# CACHE KEY & ENTRY
+# ============================================
+
+
+@dataclass(frozen=True)
+class CacheKey:
+    """Server-centric cache key."""
+
+    server: str
+    data_type: ServerDataType
+    params: FrozenSet[Tuple[str, str]] = frozenset()
+
+    @staticmethod
+    def make(server: str, data_type: ServerDataType, **params) -> "CacheKey":
+        """Create a CacheKey, converting params to a frozenset."""
+        p = frozenset((k, str(v)) for k, v in sorted(params.items()) if v is not None)
+        return CacheKey(server=server, data_type=data_type, params=p)
+
+    @property
+    def params_dict(self) -> dict:
+        return dict(self.params)
+
+
+@dataclass
+class CacheEntry:
+    """A single cached value with metadata."""
+
+    key: CacheKey
+    value: Any
+    fetched_at: float
+    consecutive_errors: int = 0
+    last_error_at: float = 0.0
+
+
+# ============================================
+# SUBSCRIPTION
+# ============================================
+
+
+@dataclass
+class Subscription:
+    """A consumer's interest in a CacheKey."""
+
+    subscriber_id: str
+    key: CacheKey
+    interval: float  # Desired refresh interval in seconds
+    callback: Optional[Callable] = None  # async callback(key, old_value, new_value)
+
+
+# ============================================
+# SERVER HEALTH
+# ============================================
+
+
+class ServerStatus(str, Enum):
+    ONLINE = "online"
+    DEGRADED = "degraded"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ServerHealth:
+    """Per-server health tracking."""
+
+    server: str
+    status: ServerStatus = ServerStatus.UNKNOWN
+    last_success_at: float = 0.0
+    last_error_at: float = 0.0
+    last_latency_ms: float = 0.0
+    consecutive_failures: int = 0
+    total_fetches: int = 0
+    total_errors: int = 0
+
+    def record_success(self, latency_ms: float) -> None:
+        self.last_success_at = time.time()
+        self.last_latency_ms = latency_ms
+        self.consecutive_failures = 0
+        self.total_fetches += 1
+        self.status = ServerStatus.ONLINE
+
+    def record_error(self) -> None:
+        self.last_error_at = time.time()
+        self.consecutive_failures += 1
+        self.total_fetches += 1
+        self.total_errors += 1
+        if self.consecutive_failures >= 5:
+            self.status = ServerStatus.OFFLINE
+        elif self.consecutive_failures >= 2:
+            self.status = ServerStatus.DEGRADED
+
+
+# ============================================
+# RATE LIMITER (token-bucket, per-server)
+# ============================================
+
+
+class RateLimiter:
+    """Async token-bucket rate limiter."""
+
+    def __init__(self, per_second: float = 5.0, per_minute: float = 100.0):
+        self._per_second = per_second
+        self._per_minute = per_minute
+        self._tokens_sec = per_second
+        self._tokens_min = per_minute
+        self._last_refill_sec = time.monotonic()
+        self._last_refill_min = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens_sec >= 1.0 and self._tokens_min >= 1.0:
+                    self._tokens_sec -= 1.0
+                    self._tokens_min -= 1.0
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed_sec = now - self._last_refill_sec
+        self._tokens_sec = min(
+            self._per_second, self._tokens_sec + elapsed_sec * self._per_second
+        )
+        self._last_refill_sec = now
+        elapsed_min = now - self._last_refill_min
+        self._tokens_min = min(
+            self._per_minute, self._tokens_min + elapsed_min * (self._per_minute / 60.0)
+        )
+        self._last_refill_min = now
+
+
+# ============================================
+# FETCH SPEC
+# ============================================
+
+
+@dataclass
+class FetchSpec:
+    """Describes how to fetch data for a ServerDataType."""
+
+    fetch_func: Callable  # async (client, **params) -> Any
+
+
+# ============================================
+# SERVER DATA SERVICE
+# ============================================
+
+_POLL_TICK = 1  # seconds between poll loop snapshots
+_CLEANUP_INTERVAL = 300  # clean stale entries every 5 min
+
+
+class ServerDataService:
+    """Unified server-centric data cache with subscription-based polling."""
+
+    def __init__(self):
+        self._cache: Dict[CacheKey, CacheEntry] = {}
+        self._subscriptions: Dict[CacheKey, Dict[str, Subscription]] = {}
+        self._health: Dict[str, ServerHealth] = {}
+        self._rate_limiters: Dict[str, RateLimiter] = {}
+        self._fetch_registry: Dict[ServerDataType, FetchSpec] = {}
+        self._poll_task: Optional[asyncio.Task] = None
+        # In-flight fetches per key (single-flight coalescing). Per-instance, so
+        # a second ServerDataService in a test never shares one.
+        self._inflight = SingleFlight()
+        self._running = False
+        self._last_cleanup = time.time()
+        # Sync listeners (e.g. WebSocketManager broadcasts)
+        self._listeners: List[Callable] = []
+        # Strong refs to fire-and-forget subscriber-callback tasks so the GC
+        # can't cancel them mid-flight (the event loop only keeps a weak
+        # reference). Entries auto-remove on completion.
+        self._callback_tasks = TaskSet(logger, "SDS callback error for %s: %s")
+
+    # ------ Fetch registry ------
+
+    def register_fetch(self, data_type: ServerDataType, fetch_func: Callable) -> None:
+        """Register a fetch function for a data type."""
+        self._fetch_registry[data_type] = FetchSpec(fetch_func=fetch_func)
+
+    # ------ Client resolution ------
+
+    async def _get_client(self, server_name: str):
+        from config_manager import get_config_manager
+
+        return await get_config_manager().get_client(server_name)
+
+    # ------ Rate limiter per server ------
+
+    def _get_rate_limiter(self, server: str) -> RateLimiter:
+        if server not in self._rate_limiters:
+            self._rate_limiters[server] = RateLimiter(per_second=5.0, per_minute=100.0)
+        return self._rate_limiters[server]
+
+    # ------ Health tracking ------
+
+    def get_server_health(self, server: str) -> ServerHealth:
+        if server not in self._health:
+            self._health[server] = ServerHealth(server=server)
+        return self._health[server]
+
+    # ------ Subscription API ------
+
+    async def subscribe(
+        self,
+        server: str,
+        data_type: ServerDataType,
+        subscriber_id: str,
+        interval: float = 0,
+        callback: Optional[Callable] = None,
+        **params,
+    ) -> CacheKey:
+        """Subscribe to data updates. Returns the CacheKey.
+
+        If interval is 0 or not provided, the data type's default cadence is
+        used — derived per key from its own TTL, so a long-lived variant is
+        polled as rarely as its freshness contract allows.
+        Callback signature: async callback(key: CacheKey, old_value, new_value)
+        """
+        key = CacheKey.make(server, data_type, **params)
+        if interval <= 0:
+            interval = _DEFAULTS[data_type].interval_for(key.params_dict)
+
+        sub = Subscription(
+            subscriber_id=subscriber_id,
+            key=key,
+            interval=interval,
+            callback=callback,
+        )
+
+        if key not in self._subscriptions:
+            self._subscriptions[key] = {}
+        self._subscriptions[key][subscriber_id] = sub
+
+        logger.debug(
+            "SDS subscribe: %s -> %s:%s (interval=%.1fs, subs=%d)",
+            subscriber_id,
+            server,
+            data_type.value,
+            interval,
+            len(self._subscriptions[key]),
+        )
+
+        # Prime cache if empty
+        if key not in self._cache:
+            try:
+                await self._fetch_and_cache(key)
+            except Exception as e:
+                logger.debug("SDS prime failed for %s: %s", key, e)
+
+        return key
+
+    def unsubscribe(self, key: CacheKey, subscriber_id: str) -> None:
+        """Remove a subscription. Stops polling if last subscriber."""
+        subs = self._subscriptions.get(key)
+        if subs:
+            subs.pop(subscriber_id, None)
+            if not subs:
+                del self._subscriptions[key]
+                logger.debug("SDS: no subscribers left for %s, polling stopped", key)
+
+    def unsubscribe_all(self, subscriber_id: str) -> None:
+        """Remove all subscriptions for a subscriber."""
+        empty_keys = []
+        for key, subs in self._subscriptions.items():
+            subs.pop(subscriber_id, None)
+            if not subs:
+                empty_keys.append(key)
+        for key in empty_keys:
+            del self._subscriptions[key]
+
+    # ------ Read API ------
+
+    def get(self, server: str, data_type: ServerDataType, **params) -> Optional[Any]:
+        """Read from cache only (hot path). Returns None if not cached or expired.
+
+        ``None`` means "nothing usable in cache", never "the server is fine": a
+        failing fetch leaves the previous value in place (see
+        :meth:`get_or_fetch`) and the entry only disappears once it expires and
+        :meth:`_cleanup_stale` is allowed to evict it. Use :meth:`get_entry` for
+        the error/age metadata behind a ``None``.
+        """
+        key = CacheKey.make(server, data_type, **params)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+
+        defaults = _DEFAULTS[data_type]
+        age = time.time() - entry.fetched_at
+
+        # Cached data is usable until the TTL expires
+        return entry.value if age <= defaults.ttl_for(key.params_dict) else None
+
+    async def get_or_fetch(
+        self, server: str, data_type: ServerDataType, **params
+    ) -> Optional[Any]:
+        """Return cached data if fresh, otherwise fetch. For REST/one-shot reads.
+
+        Three outcomes, indistinguishable from the return value alone:
+
+        1. a cache hit within the key's TTL;
+        2. a successful fetch, just written to the cache;
+        3. a *failed* fetch, which returns the previous value at whatever age it
+           has — or ``None`` if there never was one.
+
+        The third case is silent and unbounded: nothing here caps how old the
+        returned value may be, and a key with a live subscriber is never evicted
+        by :meth:`_cleanup_stale`, so with the API server down this keeps handing
+        out the last good snapshot for as long as the subscriber stays attached.
+
+        The value carries no age of its own. When freshness is load-bearing,
+        read :meth:`get_entry` alongside it for ``fetched_at``,
+        ``consecutive_errors`` and ``last_error_at``.
+        """
+        key = CacheKey.make(server, data_type, **params)
+
+        # Check cache
+        cached = self.get(server, data_type, **params)
+        if cached is not None:
+            return cached
+
+        # Fetch fresh
+        return await self._fetch_and_cache(key)
+
+    def get_entry(
+        self, server: str, data_type: ServerDataType, **params
+    ) -> Optional[CacheEntry]:
+        """Get the full cache entry (for age/metadata checks).
+
+        This is the sanctioned way to age-check a :meth:`get_or_fetch` result:
+        that call can return a value of any age when the fetch failed, and only
+        the entry's ``fetched_at`` / ``consecutive_errors`` / ``last_error_at``
+        say so.
+        """
+        key = CacheKey.make(server, data_type, **params)
+        return self._cache.get(key)
+
+    # ------ Write API (for manual puts after mutations) ------
+
+    def put(self, server: str, data_type: ServerDataType, value: Any, **params) -> None:
+        """Manually insert/update a cache entry. Fires change callbacks."""
+        key = CacheKey.make(server, data_type, **params)
+        old_entry = self._cache.get(key)
+        old_value = old_entry.value if old_entry else None
+
+        self._cache[key] = CacheEntry(
+            key=key,
+            value=value,
+            fetched_at=time.time(),
+        )
+
+        self._notify_listeners(key, value)
+
+        if value != old_value:
+            self._fire_callbacks(key, old_value, value)
+
+    # ------ Invalidation ------
+
+    def invalidate(self, server: str, *data_types: ServerDataType) -> None:
+        """Invalidate cache entries for specific data types on a server."""
+        keys_to_remove = [
+            k for k in self._cache if k.server == server and k.data_type in data_types
+        ]
+        for k in keys_to_remove:
+            del self._cache[k]
+        if keys_to_remove:
+            logger.debug(
+                "SDS invalidated %d entries for %s: %s",
+                len(keys_to_remove),
+                server,
+                [dt.value for dt in data_types],
+            )
+
+    def invalidate_server(self, server: str) -> None:
+        """Clear all cached data for a server."""
+        keys_to_remove = [k for k in self._cache if k.server == server]
+        for k in keys_to_remove:
+            del self._cache[k]
+        logger.info(
+            "SDS invalidated all cache for server %s (%d entries)",
+            server,
+            len(keys_to_remove),
+        )
+
+    # ------ Cache-write listeners (for WebSocketManager) ------
+
+    def add_listener(self, callback: Callable) -> None:
+        """Add a sync listener: ``callback(key: CacheKey, value: Any)``.
+
+        Fired on every cache write. The listener gets the typed key — server,
+        data type and params — so it never has to parse anything back out of a
+        formatted string.
+        """
+        self._listeners.append(callback)
+
+    def remove_listener(self, callback: Callable) -> None:
+        # Compared by equality, not identity: the only listener is a bound
+        # method (``ws_manager._on_data_update``), and attribute access builds a
+        # fresh method object every time, so ``is`` never matched the one that
+        # was registered and stop() left a dead manager wired to the singleton.
+        self._listeners = [cb for cb in self._listeners if cb != callback]
+
+    def _notify_listeners(self, key: CacheKey, value: Any) -> None:
+        """Hand the written key and its value to every listener, unchanged."""
+        for cb in self._listeners:
+            try:
+                cb(key, value)
+            except Exception as e:
+                logger.debug("SDS listener error: %s", e)
+
+    # ------ Lifecycle ------
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info("ServerDataService started")
+
+    async def auto_subscribe_servers(self) -> None:
+        """Subscribe to core data types for all configured servers.
+
+        Called at startup so the cache is warm before any client connects.
+        Subscribes to: PORTFOLIO, EXECUTORS, BOTS_STATUS, CONNECTORS,
+        CANDLE_CONNECTORS, POSITIONS, ACTIVE_ORDERS, SERVER_STATUS,
+        and TRADING_RULES (per connector) for every server.
+
+        All initial fetches run concurrently via asyncio.gather.
+        """
+        from config_manager import get_config_manager
+
+        cm = get_config_manager()
+        servers = cm.list_servers()  # Dict[str, dict]
+        if not servers:
+            logger.info("SDS auto-subscribe: no servers configured")
+            return
+
+        core_types = [
+            ServerDataType.PORTFOLIO,
+            ServerDataType.EXECUTORS,
+            ServerDataType.BOTS_STATUS,
+            ServerDataType.CONNECTORS,
+            ServerDataType.CANDLE_CONNECTORS,
+            ServerDataType.POSITIONS,
+            ServerDataType.ACTIVE_ORDERS,
+            ServerDataType.SERVER_STATUS,
+            ServerDataType.ALL_CONNECTORS,
+            ServerDataType.TICKER_POOL,
+        ]
+        subscriber_id = "_auto"
+
+        # Launch all core subscriptions concurrently
+        async def _sub(name: str, dt: ServerDataType) -> bool:
+            try:
+                await self.subscribe(
+                    server=name, data_type=dt, subscriber_id=subscriber_id
+                )
+                return True
+            except Exception as e:
+                logger.debug(
+                    "SDS auto-subscribe failed for %s/%s: %s", name, dt.value, e
+                )
+                return False
+
+        tasks = [_sub(name, dt) for name in servers for dt in core_types]
+        results = await asyncio.gather(*tasks)
+        count = sum(1 for r in results if r)
+
+        # Pre-subscribe trading rules concurrently across servers
+        tr_tasks = [
+            self._subscribe_trading_rules_for_server(name, subscriber_id)
+            for name in servers
+        ]
+        tr_results = await asyncio.gather(*tr_tasks, return_exceptions=True)
+        for r in tr_results:
+            if isinstance(r, int):
+                count += r
+
+        # Register on_change callback for CONNECTORS so that when a server
+        # comes online later and CONNECTORS data is fetched for the first time
+        # (or new connectors appear), we auto-subscribe TRADING_RULES.
+        for name in servers:
+            key = CacheKey.make(name, ServerDataType.CONNECTORS)
+            subs = self._subscriptions.get(key, {})
+            if subscriber_id in subs:
+                subs[subscriber_id].callback = self._make_connectors_change_callback(
+                    name
+                )
+
+        logger.info(
+            "SDS auto-subscribe: %d subscriptions for %d servers", count, len(servers)
+        )
+
+    async def _subscribe_trading_rules_for_server(
+        self, server_name: str, subscriber_id: str = "_auto"
+    ) -> int:
+        """Subscribe TRADING_RULES for all known connectors on a server. Returns count."""
+        connectors = self.get(server_name, ServerDataType.CONNECTORS)
+        if not connectors:
+            return 0
+        count = 0
+        for connector in connectors:
+            key = CacheKey.make(
+                server_name,
+                ServerDataType.TRADING_RULES,
+                connector_name=connector,
+            )
+            if key in self._subscriptions:
+                continue  # Already subscribed
+            try:
+                await self.subscribe(
+                    server=server_name,
+                    data_type=ServerDataType.TRADING_RULES,
+                    subscriber_id=subscriber_id,
+                    connector_name=connector,
+                )
+                # Check if the initial fetch failed (connector unavailable/404)
+                entry = self._cache.get(key)
+                if entry and entry.value is None and entry.consecutive_errors > 0:
+                    self.unsubscribe(key, subscriber_id)
+                    self._cache.pop(key, None)  # Clean up error-only entry
+                    logger.info(
+                        "SDS: skipping trading rules for %s/%s (connector unavailable)",
+                        server_name,
+                        connector,
+                    )
+                    continue
+                count += 1
+            except Exception as e:
+                logger.debug(
+                    "SDS auto-subscribe failed for %s/trading_rules/%s: %s",
+                    server_name,
+                    connector,
+                    e,
+                )
+        return count
+
+    def _make_connectors_change_callback(self, server_name: str) -> Callable:
+        """Create a callback that auto-subscribes TRADING_RULES when CONNECTORS change."""
+
+        async def _on_connectors_change(key: CacheKey, old_value, new_value):
+            if not new_value:
+                return
+            added = await self._subscribe_trading_rules_for_server(server_name)
+            if added:
+                logger.info(
+                    "SDS: auto-subscribed %d new TRADING_RULES for %s after CONNECTORS update",
+                    added,
+                    server_name,
+                )
+
+        return _on_connectors_change
+
+    def stop(self) -> None:
+        self._running = False
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            logger.info("ServerDataService stopped")
+        self._callback_tasks.cancel_all()
+
+    # ------ Poll loop ------
+
+    async def _poll_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(_POLL_TICK)
+                await self._poll_tick()
+
+                # Periodic cleanup
+                now = time.time()
+                if now - self._last_cleanup > _CLEANUP_INTERVAL:
+                    self._cleanup_stale()
+                    self._last_cleanup = now
+            except asyncio.CancelledError:
+                # Two very different events arrive here as the same exception:
+                # *this* task being cancelled (stop(), shutdown), and something
+                # this tick awaited being cancelled — a shared single-flight
+                # fetch killed by one of its own dependencies. Only the first
+                # ends the loop, and it is re-raised rather than swallowed so
+                # the task genuinely finishes cancelled.
+                #
+                # The second must not end it. ``break`` here left ``_running``
+                # True, and start() returns early on that, so one stray
+                # cancellation silently retired the poller for the lifetime of
+                # the process and every surface served the last cached value
+                # until Condor was restarted.
+                task = asyncio.current_task()
+                if not self._running or (task is not None and task.cancelling()):
+                    raise
+                logger.error(
+                    "SDS poll loop absorbed a cancellation it did not request; "
+                    "continuing to poll"
+                )
+                continue
+            except Exception as e:
+                logger.error("SDS poll loop error: %s", e, exc_info=True)
+                await asyncio.sleep(5)
+
+    async def _poll_tick(self) -> None:
+        """Single tick: check each subscribed key and refresh if due.
+
+        Collects all due keys first, then fetches them concurrently via gather.
+        """
+        now = time.time()
+        due_keys: List[CacheKey] = []
+
+        for key, subs in list(self._subscriptions.items()):
+            if not subs:
+                continue
+
+            # Effective interval = min of all subscriber intervals
+            effective_interval = min(s.interval for s in subs.values())
+
+            entry = self._cache.get(key)
+            if entry:
+                age = now - entry.fetched_at
+                if age < effective_interval:
+                    continue
+
+                # Exponential backoff on consecutive errors
+                if entry.consecutive_errors >= 3:
+                    backoff = min(60, 2**entry.consecutive_errors)
+                    if now - entry.last_error_at < backoff:
+                        continue
+
+            due_keys.append(key)
+
+        if not due_keys:
+            return
+
+        # Acquire rate limits and fetch concurrently
+        async def _rate_limited_fetch(key: CacheKey):
+            limiter = self._get_rate_limiter(key.server)
+            if not await limiter.acquire(timeout=0.5):
+                return
+            try:
+                await self._fetch_and_cache(key)
+            except asyncio.CancelledError:
+                # ``except Exception`` never caught this: CancelledError is a
+                # BaseException. Ours — the poll task was cancelled and gather
+                # cancelled this child with it — must propagate so stop() really
+                # stops. A cancellation that came out of the shared fetch is not
+                # ours, and must not travel up through gather into _poll_loop,
+                # where it is indistinguishable from a shutdown.
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                logger.warning(
+                    "SDS: fetch for %s:%s was cancelled by something it awaited; "
+                    "skipping it this tick",
+                    key.server,
+                    key.data_type.value,
+                )
+            except Exception:
+                pass  # Error already recorded in _fetch_and_cache
+
+        await asyncio.gather(*[_rate_limited_fetch(k) for k in due_keys])
+
+    async def _fetch_and_cache(self, key: CacheKey) -> Optional[Any]:
+        """Fetch data and update cache, coalescing concurrent fetches per key.
+
+        If a fetch for the same key is already in flight, await it instead of
+        starting a duplicate backend request. The in-flight entry is cleared
+        when the fetch settles, so a failure never poisons subsequent fetches.
+        """
+        return await self._inflight.run(key, lambda: self._do_fetch_and_cache(key))
+
+    async def _do_fetch_and_cache(self, key: CacheKey) -> Optional[Any]:
+        """Fetch data and update cache. Returns the fetched value."""
+        spec = self._fetch_registry.get(key.data_type)
+        if not spec:
+            logger.debug("SDS: no fetch registered for %s", key.data_type.value)
+            return None
+
+        health = self.get_server_health(key.server)
+        t0 = time.monotonic()
+
+        try:
+            client = await self._get_client(key.server)
+            result = await spec.fetch_func(client, **key.params_dict)
+        except Exception as e:
+            logger.debug(
+                "SDS fetch failed %s:%s: %s", key.server, key.data_type.value, e
+            )
+            health.record_error()
+
+            # Record error on cache entry
+            entry = self._cache.get(key)
+            if entry:
+                entry.consecutive_errors += 1
+                entry.last_error_at = time.time()
+                return entry.value  # Return stale
+            else:
+                # Create error-only entry
+                self._cache[key] = CacheEntry(
+                    key=key,
+                    value=None,
+                    fetched_at=0.0,
+                    consecutive_errors=1,
+                    last_error_at=time.time(),
+                )
+            return None
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        health.record_success(latency_ms)
+
+        old_entry = self._cache.get(key)
+        old_value = old_entry.value if old_entry else None
+
+        self._cache[key] = CacheEntry(
+            key=key,
+            value=result,
+            fetched_at=time.time(),
+        )
+
+        self._notify_listeners(key, result)
+
+        # Fire change callbacks only on diff
+        if result != old_value:
+            self._fire_callbacks(key, old_value, result)
+
+        return result
+
+    def _fire_callbacks(self, key: CacheKey, old_value: Any, new_value: Any) -> None:
+        """Fire subscriber callbacks asynchronously.
+
+        Each callback runs as a tracked task: a failing subscriber is logged
+        and never blocks the others or the caller.
+        """
+        subs = self._subscriptions.get(key)
+        if not subs:
+            return
+        for sub in subs.values():
+            if sub.callback:
+                try:
+                    task = asyncio.ensure_future(
+                        sub.callback(key, old_value, new_value)
+                    )
+                except Exception as e:
+                    logger.debug("SDS callback error for %s: %s", sub.subscriber_id, e)
+                else:
+                    self._callback_tasks.track(task, sub.subscriber_id)
+
+    def _cleanup_stale(self) -> None:
+        """Remove cache entries with no subscribers and expired TTL.
+
+        A key with at least one live subscriber is exempt: it is kept no matter
+        how old it is. That is what makes :meth:`get_or_fetch`'s stale-on-error
+        window unbounded for the subscribed keys (portfolio, bot status,
+        executors) while a subscriber is attached.
+        """
+        now = time.time()
+        stale = []
+        for key, entry in self._cache.items():
+            if key in self._subscriptions and self._subscriptions[key]:
+                continue  # Active subscribers, keep
+            defaults = _DEFAULTS.get(key.data_type)
+            if (
+                defaults
+                and now - entry.fetched_at > defaults.ttl_for(key.params_dict) * 2
+            ):
+                stale.append(key)
+        for key in stale:
+            del self._cache[key]
+        if stale:
+            logger.debug("SDS cleaned up %d stale entries", len(stale))
+
+    # ------ Stats ------
+
+    def get_stats(self) -> dict:
+        """Return service stats for debugging."""
+        return {
+            "cached_entries": len(self._cache),
+            "active_subscriptions": sum(len(s) for s in self._subscriptions.values()),
+            "subscribed_keys": len(self._subscriptions),
+            "servers_tracked": len(self._health),
+            "health": {
+                name: {
+                    "status": h.status.value,
+                    "consecutive_failures": h.consecutive_failures,
+                    "last_latency_ms": round(h.last_latency_ms, 1),
+                }
+                for name, h in self._health.items()
+            },
+        }
+
+
+# ============================================
+# SINGLETON
+# ============================================
+
+_instance: Optional[ServerDataService] = None
+
+
+def get_server_data_service() -> ServerDataService:
+    global _instance
+    if _instance is None:
+        _instance = ServerDataService()
+        register_default_fetches()
+    return _instance
+
+
+# ============================================
+# FETCH REGISTRATIONS
+# ============================================
+
+
+def register_default_fetches() -> None:
+    """Register the default fetch functions for all data types.
+
+    All fetch functions live in condor.fetchers — no handler imports.
+    """
+    from condor.fetchers import (
+        fetch_active_orders,
+        fetch_available_cex_connectors,
+        fetch_bot_runs,
+        fetch_bots_enrichment,
+        fetch_bots_status,
+        fetch_candle_connectors,
+        fetch_connectors,
+        fetch_current_price,
+        fetch_executors,
+        fetch_portfolio,
+        fetch_portfolio_history,
+        fetch_positions,
+        fetch_server_status,
+        fetch_ticker_pool,
+        fetch_tickers,
+        fetch_trading_rules,
+        fetch_venues,
+        probe_performance_history,
+    )
+
+    sds = get_server_data_service()
+
+    sds.register_fetch(ServerDataType.PORTFOLIO, fetch_portfolio)
+    sds.register_fetch(ServerDataType.PORTFOLIO_HISTORY, fetch_portfolio_history)
+    # strict=True on the cached reads: a failed call must reach
+    # _do_fetch_and_cache's except branch (record_error, keep the last good
+    # value, back off) instead of being cached as "nothing here".
+    sds.register_fetch(ServerDataType.PRICES, partial(fetch_current_price, strict=True))
+    sds.register_fetch(ServerDataType.POSITIONS, partial(fetch_positions, strict=True))
+    sds.register_fetch(
+        ServerDataType.ACTIVE_ORDERS, partial(fetch_active_orders, strict=True)
+    )
+    sds.register_fetch(
+        ServerDataType.TRADING_RULES, partial(fetch_trading_rules, strict=True)
+    )
+    sds.register_fetch(
+        ServerDataType.CONNECTORS, partial(fetch_available_cex_connectors, strict=True)
+    )
+    sds.register_fetch(ServerDataType.ALL_CONNECTORS, fetch_connectors)
+    sds.register_fetch(ServerDataType.VENUES, partial(fetch_venues, strict=True))
+    sds.register_fetch(ServerDataType.BOTS_STATUS, fetch_bots_status)
+    sds.register_fetch(ServerDataType.BOTS_ENRICHMENT, fetch_bots_enrichment)
+    sds.register_fetch(ServerDataType.EXECUTORS, fetch_executors)
+    sds.register_fetch(ServerDataType.BOT_RUNS, fetch_bot_runs)
+    sds.register_fetch(ServerDataType.CANDLE_CONNECTORS, fetch_candle_connectors)
+    sds.register_fetch(ServerDataType.SERVER_STATUS, fetch_server_status)
+    sds.register_fetch(
+        ServerDataType.PERF_HISTORY_CAPABILITY, probe_performance_history
+    )
+    sds.register_fetch(ServerDataType.TICKERS, partial(fetch_tickers, strict=True))
+    sds.register_fetch(
+        ServerDataType.TICKER_POOL, partial(fetch_ticker_pool, strict=True)
+    )
+
+    logger.info(
+        "ServerDataService: registered fetch functions for %d data types",
+        len(sds._fetch_registry),
+    )

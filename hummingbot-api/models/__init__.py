@@ -1,0 +1,390 @@
+"""
+Model definitions for the Backend API.
+
+Each model file corresponds to a router file with the same name.
+Models are organized by functional domain to match the API structure.
+"""
+
+# Account models
+from .accounts import CredentialRequest, LeverageRequest, PositionModeRequest
+
+# Archived bots models
+from .archived_bots import (
+    ArchivedBotListResponse,
+    BotPerformanceResponse,
+    BotSummary,
+    DatabaseStatus,
+    ExecutorInfo,
+    ExecutorsResponse,
+    OrderDetail,
+    OrderHistoryResponse,
+    OrderStatus,
+    PerformanceMetrics,
+    TradeDetail,
+    TradeHistoryResponse,
+)
+
+# Backtesting models
+from .backtesting import BacktestingConfig
+
+# Bot orchestration models (bot lifecycle management)
+from .bot_orchestration import (
+    AllBotsStatusResponse,
+    BotAction,
+    BotHistoryRequest,
+    BotHistoryResponse,
+    BotStatus,
+    ConfigureBotAction,
+    ImportStrategyAction,
+    MQTTStatus,
+    ShortcutAction,
+    StartBotAction,
+    StopAndArchiveRequest,
+    StopAndArchiveResponse,
+    StopBotAction,
+    V2ControllerDeployment,
+    V2ScriptDeployment,
+)
+
+# Connector models
+from .connectors import (
+    ConnectorConfigMapResponse,
+    ConnectorInfo,
+    ConnectorListResponse,
+    ConnectorOrderTypesResponse,
+    ConnectorTradingRulesResponse,
+    TradingRule,
+)
+
+# Controller models
+from .controllers import Controller, ControllerConfig, ControllerConfigResponse, ControllerResponse, ControllerType
+
+# Docker models
+from .docker import DockerImage
+
+# Executor models
+from .executors import (
+    CreateExecutorRequest,
+    CreateExecutorResponse,
+    ExecutorDetailResponse,
+    ExecutorFilterRequest,
+    ExecutorResponse,
+    ExecutorsSummaryResponse,
+    OrphanedPositionRecord,
+    OrphanedPositionsResponse,
+    StopExecutorRequest,
+    StopExecutorResponse,
+)
+
+# Gateway models (consolidated)
+from .gateway import (
+    AddPoolRequest,
+    AddTokenRequest,
+    GatewayBalanceRequest,
+    GatewayConfig,
+    GatewayStatus,
+    GatewayWalletCredential,
+    GatewayWalletInfo,
+    SetDefaultWalletRequest,
+    UpdateApiKeysRequest,
+)
+
+# Gateway Trading models (Swap + CLMM + AMM)
+from .gateway_trading import (  # Swap models; CLMM models; AMM models; Pool info models; Pool listing models
+    AMMAddLiquidityRequest,
+    AMMCreatePoolRequest,
+    AMMCreatePoolResponse,
+    AMMPoolInfoResponse,
+    AMMPositionDetail,
+    AMMPositionInfoResponse,
+    AMMPositionsOwnedRequest,
+    AMMQuoteLiquidityRequest,
+    AMMQuoteLiquidityResponse,
+    AMMRemoveLiquidityRequest,
+    AMMTransactionResponse,
+    CLMMAddLiquidityRequest,
+    CLMMClosePositionRequest,
+    CLMMClosePositionResponse,
+    CLMMCollectFeesRequest,
+    CLMMCollectFeesResponse,
+    CLMMCreatePoolRequest,
+    CLMMOpenPositionRequest,
+    CLMMOpenPositionResponse,
+    CLMMPoolBin,
+    CLMMPoolInfoResponse,
+    CLMMPoolListItem,
+    CLMMPoolListResponse,
+    CLMMPositionInfo,
+    CLMMPositionsOwnedRequest,
+    CLMMQuotePositionRequest,
+    CLMMQuotePositionResponse,
+    CLMMRemoveLiquidityRequest,
+    SwapExecuteQuoteRequest,
+    SwapExecuteRequest,
+    SwapExecuteResponse,
+    SwapQuoteRequest,
+    SwapQuoteResponse,
+)
+
+# Market data models
+from .market_data import (  # New enhanced market data models; Ticker & rate models; Trading pair management models
+    ActiveFeedInfo,
+    ActiveFeedsResponse,
+    AddTradingPairRequest,
+    CandleData,
+    CandlesResponse,
+    FundingInfoRequest,
+    FundingInfoResponse,
+    MarketDataSettings,
+    OrderBookLevel,
+    OrderBookQueryRequest,
+    OrderBookQueryResult,
+    OrderBookRequest,
+    OrderBookResponse,
+    PoolPricesResponse,
+    PriceData,
+    PriceForQuoteVolumeRequest,
+    PriceForVolumeRequest,
+    PriceRequest,
+    PricesResponse,
+    QuoteVolumeForPriceRequest,
+    RateRequest,
+    RatesResponse,
+    RemoveTradingPairRequest,
+    SingleRateResponse,
+    SupportedOrderTypesResponse,
+    TickerInfo,
+    TickersResponse,
+    TradingPairResponse,
+    TradingRulesResponse,
+    VolumeForPriceRequest,
+    VWAPForVolumeRequest,
+)
+
+# Pagination models
+from .pagination import PaginatedResponse, PaginationParams, TimeRangePaginationParams
+
+# Portfolio models
+from .portfolio import (
+    AccountDistribution,
+    AccountPortfolioState,
+    AccountsDistributionResponse,
+    ConnectorBalances,
+    HistoricalPortfolioState,
+    PortfolioDistributionResponse,
+    PortfolioHistoryFilters,
+    PortfolioStateResponse,
+    TokenBalance,
+    TokenDistribution,
+)
+
+# Script models
+from .scripts import Script, ScriptConfig, ScriptConfigResponse, ScriptResponse
+
+# System models
+from .system import SelfUpgradeRequest
+
+# Trading models
+from .trading import (
+    AccountBalance,
+    ActiveOrderFilterRequest,
+    ActiveOrdersResponse,
+    ConnectorBalance,
+    FundingPaymentFilterRequest,
+    OrderFilterRequest,
+    OrderInfo,
+    OrderSummary,
+    OrderTypesResponse,
+    PortfolioState,
+    PositionFilterRequest,
+    TokenInfo,
+    TradeFilterRequest,
+    TradeInfo,
+    TradeRequest,
+    TradeResponse,
+    TradingRulesInfo,
+)
+
+__all__ = [
+    # Bot orchestration models
+    "BotAction",
+    "StartBotAction",
+    "StopBotAction",
+    "ImportStrategyAction",
+    "ConfigureBotAction",
+    "ShortcutAction",
+    "BotStatus",
+    "BotHistoryRequest",
+    "BotHistoryResponse",
+    "MQTTStatus",
+    "AllBotsStatusResponse",
+    "StopAndArchiveRequest",
+    "StopAndArchiveResponse",
+    "V2ControllerDeployment",
+    "V2ScriptDeployment",
+    # Trading models
+    "TradeRequest",
+    "TradeResponse",
+    "TokenInfo",
+    "ConnectorBalance",
+    "AccountBalance",
+    "PortfolioState",
+    "OrderInfo",
+    "ActiveOrdersResponse",
+    "OrderSummary",
+    "TradeInfo",
+    "TradingRulesInfo",
+    "OrderTypesResponse",
+    "OrderFilterRequest",
+    "ActiveOrderFilterRequest",
+    "PositionFilterRequest",
+    "FundingPaymentFilterRequest",
+    "TradeFilterRequest",
+    # Controller models
+    "ControllerType",
+    "Controller",
+    "ControllerResponse",
+    "ControllerConfig",
+    "ControllerConfigResponse",
+    # Script models
+    "Script",
+    "ScriptResponse",
+    "ScriptConfig",
+    "ScriptConfigResponse",
+    # Market data models
+    "CandleData",
+    "CandlesResponse",
+    "ActiveFeedInfo",
+    "ActiveFeedsResponse",
+    "MarketDataSettings",
+    "TradingRulesResponse",
+    "SupportedOrderTypesResponse",
+    # New enhanced market data models
+    "PriceRequest",
+    "PriceData",
+    "PricesResponse",
+    "FundingInfoRequest",
+    "FundingInfoResponse",
+    "OrderBookRequest",
+    "OrderBookLevel",
+    "OrderBookResponse",
+    "OrderBookQueryRequest",
+    "VolumeForPriceRequest",
+    "PriceForVolumeRequest",
+    "QuoteVolumeForPriceRequest",
+    "PriceForQuoteVolumeRequest",
+    "VWAPForVolumeRequest",
+    "OrderBookQueryResult",
+    # Trading pair management models
+    "AddTradingPairRequest",
+    "RemoveTradingPairRequest",
+    "TradingPairResponse",
+    # Ticker & rate models
+    "TickerInfo",
+    "TickersResponse",
+    "RateRequest",
+    "RatesResponse",
+    "SingleRateResponse",
+    "PoolPricesResponse",
+    # Account models
+    "LeverageRequest",
+    "PositionModeRequest",
+    "CredentialRequest",
+    # Docker models
+    "DockerImage",
+    # Gateway models
+    "GatewayConfig",
+    "GatewayStatus",
+    "SetDefaultWalletRequest",
+    "GatewayWalletCredential",
+    "GatewayWalletInfo",
+    "GatewayBalanceRequest",
+    "AddPoolRequest",
+    "AddTokenRequest",
+    "UpdateApiKeysRequest",
+    # Backtesting models
+    "BacktestingConfig",
+    # Pagination models
+    "PaginatedResponse",
+    "PaginationParams",
+    "TimeRangePaginationParams",
+    # Connector models
+    "ConnectorInfo",
+    "ConnectorConfigMapResponse",
+    "TradingRule",
+    "ConnectorTradingRulesResponse",
+    "ConnectorOrderTypesResponse",
+    "ConnectorListResponse",
+    # Gateway Trading models
+    "SwapQuoteRequest",
+    "SwapQuoteResponse",
+    # AMM models
+    "AMMPoolInfoResponse",
+    "AMMPositionDetail",
+    "AMMPositionInfoResponse",
+    "AMMTransactionResponse",
+    "AMMQuoteLiquidityRequest",
+    "AMMQuoteLiquidityResponse",
+    "AMMAddLiquidityRequest",
+    "AMMRemoveLiquidityRequest",
+    "AMMCreatePoolRequest",
+    "AMMCreatePoolResponse",
+    "AMMPositionsOwnedRequest",
+    "SwapExecuteQuoteRequest",
+    "SwapExecuteRequest",
+    "SwapExecuteResponse",
+    "CLMMOpenPositionRequest",
+    "CLMMOpenPositionResponse",
+    "CLMMAddLiquidityRequest",
+    "CLMMRemoveLiquidityRequest",
+    "CLMMClosePositionRequest",
+    "CLMMCollectFeesRequest",
+    "CLMMClosePositionResponse",
+    "CLMMCreatePoolRequest",
+    "CLMMCollectFeesResponse",
+    "CLMMPositionsOwnedRequest",
+    "CLMMQuotePositionRequest",
+    "CLMMQuotePositionResponse",
+    "CLMMPositionInfo",
+    "CLMMPoolBin",
+    "CLMMPoolInfoResponse",
+    "CLMMPoolListItem",
+    "CLMMPoolListResponse",
+    # Portfolio models
+    "TokenBalance",
+    "ConnectorBalances",
+    "AccountPortfolioState",
+    "PortfolioStateResponse",
+    "TokenDistribution",
+    "PortfolioDistributionResponse",
+    "AccountDistribution",
+    "AccountsDistributionResponse",
+    "HistoricalPortfolioState",
+    "PortfolioHistoryFilters",
+    # Archived bots models
+    "OrderStatus",
+    "DatabaseStatus",
+    "BotSummary",
+    "PerformanceMetrics",
+    "TradeDetail",
+    "OrderDetail",
+    "ExecutorInfo",
+    "ArchivedBotListResponse",
+    "BotPerformanceResponse",
+    "TradeHistoryResponse",
+    "OrderHistoryResponse",
+    "ExecutorsResponse",
+    # Executor models
+    "CreateExecutorRequest",
+    "CreateExecutorResponse",
+    "StopExecutorRequest",
+    "StopExecutorResponse",
+    "ExecutorFilterRequest",
+    "ExecutorResponse",
+    "ExecutorDetailResponse",
+    "ExecutorsSummaryResponse",
+    "OrphanedPositionRecord",
+    "OrphanedPositionsResponse",
+    # System models
+    "SelfUpgradeRequest",
+]

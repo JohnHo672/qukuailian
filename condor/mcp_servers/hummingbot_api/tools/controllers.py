@@ -1,0 +1,582 @@
+"""
+Controller management operations business logic.
+
+This module provides the core business logic for managing controllers and their
+configurations, including exploration, modification, and bot deployment.
+"""
+
+import asyncio
+from typing import Any, Literal
+
+# Internal/auto-managed fields that should be skipped during schema validation
+_SKIP_FIELDS = {
+    "id",
+    "controller_name",
+    "controller_type",
+    "candles_config",
+    "initial_positions",
+}
+
+
+async def _gather_calls(*awaitables: Any) -> list[Any]:
+    """Await independent API calls concurrently, preserving sequential failure.
+
+    ``return_exceptions=True`` rather than gather's default: with the default,
+    the first failure propagates immediately while its siblings keep running
+    unawaited, so a second failure surfaces later as asyncio's "Task exception
+    was never retrieved" with nothing naming it. Here every leg settles first
+    and the first exception *in call order* is re-raised, which is exactly the
+    error the sequential code produced.
+
+    A ``CancelledError`` handed back as a *result* means some other party
+    cancelled that leg -- not that this task is shutting down. Re-raising it
+    verbatim would make our caller read a leg's cancellation as its own
+    (CORR-332), so it is only propagated when this task is genuinely being
+    cancelled (CORR-601's ``cancelling()`` check); otherwise it is reported as
+    the plain failure it is. Our own cancellation still arrives the normal way:
+    ``gather`` cancels the legs and re-raises out of the ``await`` below.
+    """
+    results = await asyncio.gather(*awaitables, return_exceptions=True)
+    for result in results:
+        if isinstance(result, asyncio.CancelledError):
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise result
+            raise RuntimeError("Controller API call was cancelled") from result
+        if isinstance(result, BaseException):
+            raise result
+    return list(results)
+
+
+def _validate_config_against_template(
+    config_data: dict[str, Any],
+    template: dict[str, Any],
+) -> None:
+    """
+    Validate config_data covers all fields declared in the controller's template schema.
+
+    Checks that every template parameter that has no default (or defaults to None)
+    is explicitly provided in config_data. Also warns about fields in config_data
+    that don't exist in the template at all (potential typos or schema drift).
+
+    Raises:
+        ValueError: If required fields are missing or unknown fields are present.
+    """
+    missing_fields: list[str] = []
+    unknown_fields: list[str] = []
+
+    # Check all template fields are covered
+    for param_name, param_info in template.items():
+        if param_name in _SKIP_FIELDS:
+            continue
+        default = param_info.get("default")
+        has_default = default is not None
+        if not has_default and param_name not in config_data:
+            param_type = str(param_info.get("type", "unknown"))
+            param_type = param_type.replace("<class '", "").replace("'>", "")
+            missing_fields.append(f"  - {param_name} ({param_type})")
+
+    # Check for fields in config_data that aren't in the template
+    template_fields = set(template.keys()) | _SKIP_FIELDS
+    for key in config_data:
+        if key not in template_fields:
+            unknown_fields.append(f"  - {key}")
+
+    if missing_fields:
+        raise ValueError(
+            "Config validation failed against controller template schema.\n\n"
+            "Missing required fields (no default value in schema):\n"
+            + "\n".join(missing_fields)
+            + "\n\nUse manage_controllers(action='describe', controller_name='"
+            + str(config_data.get("controller_name", "..."))
+            + "') to see all available parameters and their defaults."
+        )
+    # Note: unknown_fields are NOT raised as an error. On backends whose
+    # load_controller_config_class still resolves a controller to its *base* config class
+    # (it matched sibling bases and took whichever sorted first by name, so e.g.
+    # ema_trend_v1 -> DirectionalTradingControllerConfigBase), this template lists only
+    # base fields and every controller-specific param looks "unknown". Raising here would
+    # block valid configs. The backend's own validate_controller_config call below is the
+    # authoritative check -- and on a patched backend it is also the one that stops being
+    # a false negative.
+
+
+async def manage_controllers(
+    client: Any,
+    action: Literal["list", "describe", "upsert", "delete"],
+    target: Literal["controller", "config"] | None = None,
+    controller_type: (
+        Literal["directional_trading", "market_making", "generic"] | None
+    ) = None,
+    controller_name: str | None = None,
+    controller_code: str | None = None,
+    config_name: str | None = None,
+    config_data: dict[str, Any] | None = None,
+    confirm_override: bool = False,
+    include_code: bool = False,
+) -> dict[str, Any]:
+    """
+    Unified controller management: list, describe, upsert, delete.
+
+    Design-time only — works with saved templates and configs for future deployments.
+    Does NOT affect running bots. To modify a live bot's config, use manage_bots with action='update_config'.
+
+    Routes to explore_controllers for list/describe and modify_controllers for upsert/delete.
+    """
+    if action in ("list", "describe"):
+        return await explore_controllers(
+            client=client,
+            action=action,
+            controller_type=controller_type,
+            controller_name=controller_name,
+            config_name=config_name,
+            include_code=include_code,
+        )
+    elif action in ("upsert", "delete"):
+        if not target:
+            raise ValueError(
+                "'target' parameter ('controller' or 'config') is required for upsert/delete actions"
+            )
+        return await modify_controllers(
+            client=client,
+            action=action,
+            target=target,
+            controller_type=controller_type,
+            controller_name=controller_name,
+            controller_code=controller_code,
+            config_name=config_name,
+            config_data=config_data,
+            confirm_override=confirm_override,
+        )
+    else:
+        raise ValueError(
+            f"Invalid action '{action}'. Use 'list', 'describe', 'upsert', or 'delete'."
+        )
+
+
+async def explore_controllers(
+    client: Any,
+    action: Literal["list", "describe"],
+    controller_type: (
+        Literal["directional_trading", "market_making", "generic"] | None
+    ) = None,
+    controller_name: str | None = None,
+    config_name: str | None = None,
+    include_code: bool = False,
+) -> dict[str, Any]:
+    """
+    Explore controllers and their configurations.
+
+    Args:
+        client: Hummingbot API client
+        action: "list" to list controllers or "describe" to show details
+        controller_type: Type of controller to filter by
+        controller_name: Name of controller to describe
+        config_name: Name of config to describe
+        include_code: If True, include full controller source code in describe output
+
+    Returns:
+        Dictionary containing exploration results and formatted output
+    """
+    # Wave 1: everything that depends on nothing. Both lists are independent
+    # of each other, and the named config only feeds controller_name resolution
+    # in the describe branch below, so all three travel together instead of
+    # costing three serial round trips to a usually remote API host.
+    wants_config = action == "describe" and bool(config_name)
+    wave_1: list[Any] = [
+        client.controllers.list_controllers(),
+        client.controllers.list_controller_configs(),
+    ]
+    if wants_config:
+        wave_1.append(client.controllers.get_controller_config(config_name))
+
+    wave_1_results = await _gather_calls(*wave_1)
+    controllers = wave_1_results[0]
+    configs = wave_1_results[1]
+    config = wave_1_results[2] if wants_config else None
+
+    # One pass over the configs instead of one rescan per controller below.
+    configs_by_controller: dict[Any, list[dict[str, Any]]] = {}
+    for cfg in configs:
+        configs_by_controller.setdefault(cfg.get("controller_name"), []).append(cfg)
+
+    if action == "list":
+        result = "Available Controllers:\n\n"
+        for c_type, controller_list in controllers.items():
+            if controller_type is not None and c_type != controller_type:
+                continue
+            result += f"Controller Type: {c_type}\n"
+            for controller in controller_list:
+                controller_configs = configs_by_controller.get(controller, [])
+                result += f"- {controller} ({len(controller_configs)} configs)\n"
+                if len(controller_configs) > 0:
+                    for config in controller_configs:
+                        result += f"    - {config.get('id', 'unknown')}\n"
+
+        return {
+            "action": "list",
+            "controllers": controllers,
+            "configs": configs,
+            "formatted_output": result,
+        }
+
+    elif action == "describe":
+        result = ""
+
+        # Config details (fetched in wave 1) — show them directly
+        if config_name:
+            if config:
+                if controller_name and controller_name != config.get("controller_name"):
+                    controller_name = config.get("controller_name")
+                    result += f"Controller name not matching, using config's controller name: {controller_name}\n"
+                elif not controller_name:
+                    controller_name = config.get("controller_name")
+                result += f"Config '{config_name}' Details:\n"
+                for key, value in config.items():
+                    result += f"  {key}: {value}\n"
+                result += "\n"
+
+        if not controller_name:
+            return {
+                "action": "describe",
+                "error": "Please provide a controller_name or config_name to describe.",
+                "formatted_output": "Please provide a controller_name or config_name to describe.",
+            }
+
+        # Determine the controller type
+        found_controller_type = None
+        for c_type, controller_list in controllers.items():
+            if controller_name in controller_list:
+                found_controller_type = c_type
+                break
+
+        if not found_controller_type:
+            return {
+                "action": "describe",
+                "error": f"Controller '{controller_name}' not found.",
+                "formatted_output": f"Controller '{controller_name}' not found.",
+            }
+
+        # Wave 2: the template (lightweight — just the parameter schema) and,
+        # only when explicitly requested, the full source. Both need
+        # found_controller_type, and neither needs the other.
+        wave_2: list[Any] = [
+            client.controllers.get_controller_config_template(
+                found_controller_type, controller_name
+            )
+        ]
+        if include_code:
+            wave_2.append(
+                client.controllers.get_controller(
+                    found_controller_type, controller_name
+                )
+            )
+        wave_2_results = await _gather_calls(*wave_2)
+        template = wave_2_results[0]
+        controller_code_content = wave_2_results[1] if include_code else None
+
+        controller_configs = [
+            c.get("id") for c in configs_by_controller.get(controller_name, [])
+        ]
+
+        result += f"Controller: {controller_name} ({found_controller_type})\n\n"
+
+        if include_code:
+            result += f"Controller Code:\n{controller_code_content}\n\n"
+
+        # Format config template parameters as table
+        result += "Configuration Parameters:\n"
+        result += "parameter                    | type              | default\n"
+        result += "-" * 80 + "\n"
+
+        for param_name, param_info in template.items():
+            if param_name in [
+                "id",
+                "controller_name",
+                "controller_type",
+                "candles_config",
+                "initial_positions",
+            ]:
+                continue  # Skip internal fields
+
+            param_type = str(param_info.get("type", "unknown"))
+            # Simplify type names
+            param_type = (
+                param_type.replace("<class '", "")
+                .replace("'>", "")
+                .replace("decimal.Decimal", "Decimal")
+            )
+            param_type = param_type.replace("typing.", "").split(".")[-1][:15]
+
+            default = str(param_info.get("default", "None"))
+            if len(default) > 30:
+                default = default[:27] + "..."
+
+            result += f"{param_name:28} | {param_type:17} | {default}\n"
+
+        result += "\n"
+
+        # Format configs list
+        result += f"Total Configs: {len(controller_configs)}\n"
+        if len(controller_configs) <= 10:
+            result += (
+                "Configs:\n"
+                + "\n".join(f"  - {c}" for c in controller_configs if c)
+                + "\n"
+            )
+        else:
+            result += f"Configs (showing first 10 of {len(controller_configs)}):\n"
+            result += "\n".join(f"  - {c}" for c in controller_configs[:10] if c) + "\n"
+            result += f"  ... and {len(controller_configs) - 10} more\n"
+
+        if not include_code:
+            result += (
+                "\nTip: Set include_code=True to see the full controller source code.\n"
+            )
+
+        return_data = {
+            "action": "describe",
+            "controller_name": controller_name,
+            "controller_type": found_controller_type,
+            "template": template,
+            "configs": controller_configs,
+            "config_details": config,
+            "formatted_output": result,
+        }
+        if controller_code_content is not None:
+            return_data["controller_code"] = controller_code_content
+        return return_data
+
+    else:
+        return {
+            "action": action,
+            "error": "Invalid action. Use 'list' or 'describe'.",
+            "formatted_output": "Invalid action. Use 'list' or 'describe'.",
+        }
+
+
+async def modify_controllers(
+    client: Any,
+    action: Literal["upsert", "delete"],
+    target: Literal["controller", "config"],
+    controller_type: (
+        Literal["directional_trading", "market_making", "generic"] | None
+    ) = None,
+    controller_name: str | None = None,
+    controller_code: str | None = None,
+    config_name: str | None = None,
+    config_data: dict[str, Any] | None = None,
+    confirm_override: bool = False,
+) -> dict[str, Any]:
+    """
+    Create, update, or delete controllers and saved configurations (design-time only).
+
+    Does NOT affect running bots. To modify a live bot's config, use manage_bots with action='update_config'.
+
+    Args:
+        client: Hummingbot API client
+        action: "upsert" (create/update) or "delete"
+        target: "controller" (template) or "config" (instance)
+        controller_type: Type of controller
+        controller_name: Name of controller
+        controller_code: Code for controller (required for controller upsert)
+        config_name: Name of config
+        config_data: Configuration data (required for config upsert)
+        confirm_override: Confirm overwriting existing items
+
+    Returns:
+        Dictionary containing modification results and message
+
+    Raises:
+        ValueError: If required parameters are missing or invalid
+    """
+    if target == "controller":
+        if action == "upsert":
+            if not controller_type or not controller_name or not controller_code:
+                raise ValueError(
+                    "controller_type, controller_name, and controller_code are required for controller upsert"
+                )
+
+            # Check if controller exists
+            controllers = await client.controllers.list_controllers()
+            exists = controller_name in controllers.get(controller_type, [])
+
+            if exists and not confirm_override:
+                existing_code = await client.controllers.get_controller(
+                    controller_type, controller_name
+                )
+                return {
+                    "action": "upsert",
+                    "target": "controller",
+                    "exists": True,
+                    "controller_name": controller_name,
+                    "controller_type": controller_type,
+                    "current_code": existing_code,
+                    "message": (
+                        f"Controller '{controller_name}' already exists and this is the current code: {existing_code}. "
+                        f"Set confirm_override=True to update it."
+                    ),
+                }
+
+            # POST /controllers/{type}/{name} expects a Controller body -- an OBJECT with a
+            # "content" field -- not a bare source string. Passing the string through made
+            # FastAPI reject the body with 422 for every controller upload.
+            result = await client.controllers.create_or_update_controller(
+                controller_type,
+                controller_name,
+                {"content": controller_code, "type": controller_type},
+            )
+
+            return {
+                "action": "upsert",
+                "target": "controller",
+                "exists": exists,
+                "controller_name": controller_name,
+                "controller_type": controller_type,
+                "result": result,
+                "message": f"Controller {'updated' if exists else 'created'}: {result}",
+            }
+
+        elif action == "delete":
+            if not controller_type or not controller_name:
+                raise ValueError(
+                    "controller_type and controller_name are required for controller delete"
+                )
+
+            result = await client.controllers.delete_controller(
+                controller_type, controller_name
+            )
+
+            return {
+                "action": "delete",
+                "target": "controller",
+                "controller_name": controller_name,
+                "controller_type": controller_type,
+                "result": result,
+                "message": f"Controller deleted: {result}",
+            }
+
+    elif target == "config":
+        if action == "upsert":
+            if not config_name or not config_data:
+                raise ValueError(
+                    "config_name and config_data are required for config upsert"
+                )
+
+            # Extract controller_type and controller_name from config_data
+            config_controller_type = config_data.get("controller_type")
+            config_controller_name = config_data.get("controller_name")
+
+            if not config_controller_type or not config_controller_name:
+                raise ValueError(
+                    "config_data must include 'controller_type' and 'controller_name'"
+                )
+
+            # Always set the config id to match the config name (file name), so the
+            # backend gets a complete config for validation and storage.
+            if config_data.get("id") != config_name:
+                config_data["id"] = config_name
+
+            # Validate config against template schema before sending to backend
+            template = await client.controllers.get_controller_config_template(
+                config_controller_type, config_controller_name
+            )
+            _validate_config_against_template(config_data, template)
+
+            # Validate config with backend
+            await client.controllers.validate_controller_config(
+                config_controller_type, config_controller_name, config_data
+            )
+
+            controller_configs = await client.controllers.list_controller_configs()
+            exists = config_name in [c.get("id") for c in controller_configs]
+
+            if exists and not confirm_override:
+                existing_config = await client.controllers.get_controller_config(
+                    config_name
+                )
+                return {
+                    "action": "upsert",
+                    "target": "config",
+                    "exists": True,
+                    "config_name": config_name,
+                    "current_config": existing_config,
+                    "message": (
+                        f"Config '{config_name}' already exists with data: {existing_config}. "
+                        "Set confirm_override=True to update it."
+                    ),
+                }
+
+            # Strip internal fields like _config_name that cause Pydantic validation errors
+            clean_data = {k: v for k, v in config_data.items() if not k.startswith("_")}
+            result = await client.controllers.create_or_update_controller_config(
+                config_name, clean_data
+            )
+            return {
+                "action": "upsert",
+                "target": "config",
+                "exists": exists,
+                "config_name": config_name,
+                "result": result,
+                "message": f"Config {'updated' if exists else 'created'}: {result}",
+            }
+
+        elif action == "delete":
+            if not config_name:
+                raise ValueError("config_name is required for config delete")
+
+            result = await client.controllers.delete_controller_config(config_name)
+
+            return {
+                "action": "delete",
+                "target": "config",
+                "config_name": config_name,
+                "result": result,
+                "message": f"Config deleted: {result}",
+            }
+
+    else:
+        raise ValueError("Invalid target. Must be 'controller' or 'config'.")
+
+
+async def deploy_bot(
+    client: Any,
+    bot_name: str,
+    controllers_config: list[str],
+    account_name: str | None = "master_account",
+    max_global_drawdown_quote: float | None = None,
+    max_controller_drawdown_quote: float | None = None,
+    image: str = "hummingbot/hummingbot:latest",
+) -> dict[str, Any]:
+    """
+    Deploy a bot with specified controller configurations.
+
+    Args:
+        client: Hummingbot API client
+        bot_name: Name of the bot to deploy
+        controllers_config: List of controller config names
+        account_name: Account name to use
+        max_global_drawdown_quote: Maximum global drawdown
+        max_controller_drawdown_quote: Maximum per-controller drawdown
+        image: Docker image to use
+
+    Returns:
+        Dictionary containing deployment results
+    """
+    result = await client.bot_orchestration.deploy_v2_controllers(
+        instance_name=bot_name,
+        controllers_config=controllers_config,
+        credentials_profile=account_name,
+        max_global_drawdown_quote=max_global_drawdown_quote,
+        max_controller_drawdown_quote=max_controller_drawdown_quote,
+        image=image,
+    )
+
+    return {
+        "bot_name": bot_name,
+        "controllers_config": controllers_config,
+        "account_name": account_name,
+        "image": image,
+        "result": result,
+        "message": f"Bot Deployment Result: {result}",
+    }

@@ -1,0 +1,410 @@
+"""Routines API routes — discover, run, schedule, and view routine results."""
+
+from __future__ import annotations
+
+import inspect
+import logging
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+from condor import routine_hooks
+from condor.reports import list_reports
+from condor.routine_store import get_routine_store, routine_source_roots
+from condor.runtime import client, wake
+from condor.runtime.wake import (
+    ON_COMPLETE_CHOICES,
+    ON_COMPLETE_NOTIFY,
+    ON_COMPLETE_RESUME,
+)
+from condor.web.auth import (
+    check_server_access,
+    get_current_user,
+    report_owner_filter,
+    require_server_access_query,
+)
+from condor.web.models import WebUser
+from config_manager import get_config_manager
+
+log = logging.getLogger(__name__)
+router = APIRouter(prefix="/routines", tags=["routines"])
+
+
+# ── Request / Response Models ──
+
+
+class RunRequestV2(BaseModel):
+    routine_name: str
+    server_name: str
+    config: dict = {}
+    # Which assistant produced this run's reports. Empty (the dashboard's own
+    # calls) derives it from the routine's source; the MCP runner sends it
+    # because it knows which agent asked — see RoutineStore._execute_and_record.
+    attribute_to: str = ""
+    # The MCP caller's session, resolved here into the conversation the run
+    # reports back to when it finishes (ARCH-089). Empty for the dashboard's own
+    # calls, which have no conversation behind them.
+    session_key: str = ""
+    # What that conversation gets when the run ends: "notify" (a line to read)
+    # or "resume" (the asking agent is woken with the outcome and continues).
+    # The dashboard never sends it — a human watching the page is the caller
+    # ``notify`` exists for.
+    on_complete: str = ON_COMPLETE_NOTIFY
+
+
+class OnCompleteRequest(BaseModel):
+    on_complete: str = ON_COMPLETE_NOTIFY
+
+
+class ScheduleRequestV2(BaseModel):
+    routine_name: str
+    server_name: str
+    config: dict = {}
+    interval_sec: int = 300
+
+
+class HookTelegram(BaseModel):
+    enabled: bool = False
+    chat_ids: list[str] = []
+
+
+class HooksRequest(BaseModel):
+    telegram: HookTelegram = HookTelegram()
+    trigger: str = "success"
+
+
+# ── Helpers ──
+
+
+def _owns(inst: dict, user: WebUser) -> bool:
+    """Whether ``user`` started this instance.
+
+    The owner is the ``user_id`` RoutineStore records in the instance meta.
+    Telegram-started instances now carry it too (CORR-165: the starting user,
+    not the chat). An instance without one is nobody's — MCP runs that carried
+    no user, or meta written by an older build — and treating them as unowned
+    keeps them out of every non-admin's reach instead of handing them to
+    whoever asks first.
+    """
+    owner = inst.get("user_id")
+    return bool(owner) and owner == user.id
+
+
+def _require_instance_access(inst: dict, user: WebUser) -> None:
+    """Admins reach every instance; everyone else only their own (SEC-150)."""
+    if get_config_manager().is_admin(user.id):
+        return
+    if not _owns(inst, user):
+        raise HTTPException(status_code=403, detail="Not your instance")
+
+
+def _bounded_on_complete(requested: str, conversation_id: str) -> str:
+    """``resume``, unless this conversation is already inside a wake turn.
+
+    The same depth-1 bound the delegate route holds, for the same reason and
+    with no rate limiter: a run submitted *from* a woken turn may not wake the
+    conversation again, so a routine that ends by starting another one cannot
+    drive an unbounded chain of model turns. Downgrading to ``notify`` still
+    delivers — the outcome reaches the transcript and the surface, only without
+    a turn behind it.
+    """
+    if requested == ON_COMPLETE_RESUME and wake.is_waking(conversation_id):
+        log.info(
+            "Forcing on_complete=notify: conversation %s is already mid-wake",
+            conversation_id,
+        )
+        return ON_COMPLETE_NOTIFY
+    return requested
+
+
+def _authorized_instance(instance_id: str, user: WebUser) -> dict:
+    """Fetch an instance, 404 if absent and 403 if it belongs to someone else."""
+    inst = get_routine_store().get_instance(instance_id)
+    if not inst:
+        raise HTTPException(404, "Instance not found")
+    _require_instance_access(inst, user)
+    return inst
+
+
+# ── Routes ──
+
+
+@router.get("")
+async def list_routines(user: WebUser = Depends(get_current_user)):
+    """List all discovered routines with their fields.
+
+    Deliberately every routine the install has, agent-prefixed ones included,
+    for any approved user (SEC-617). Routine *definitions* are install-wide
+    because the whole agent layer is: ``GET /agents`` lists them unscoped and
+    ``_strategy_principal`` in ``routes/agents.py`` records that agents and
+    strategies are one global store. The owner filter below reaches only the
+    ``report_count`` on each row — the per-user part of this response — exactly
+    as ``GET /reports`` scopes the same tally (SEC-593).
+    """
+    store = get_routine_store()
+    return store.list_routines(owner_id=report_owner_filter(user))
+
+
+@router.get("/instances")
+async def list_instances(user: WebUser = Depends(get_current_user)):
+    """List the caller's active routine instances (admins see them all)."""
+    store = get_routine_store()
+    instances = store.list_instances()
+    if get_config_manager().is_admin(user.id):
+        return instances
+    return [inst for inst in instances if _owns(inst, user)]
+
+
+@router.get("/instances/{instance_id}")
+async def get_instance(instance_id: str, user: WebUser = Depends(get_current_user)):
+    """Get instance detail including last result."""
+    return _authorized_instance(instance_id, user)
+
+
+@router.get("/instances/{instance_id}/image")
+async def get_instance_image(
+    instance_id: str, user: WebUser = Depends(get_current_user)
+):
+    """Serve the chart PNG for an instance result."""
+    _authorized_instance(instance_id, user)
+    result = get_routine_store().get_result(instance_id)
+    if not result or not result.chart_image:
+        raise HTTPException(404, "No chart image available")
+    return Response(content=result.chart_image, media_type="image/png")
+
+
+@router.post("/run")
+async def run_routine_v2(
+    body: RunRequestV2,
+    user: WebUser = Depends(get_current_user),
+):
+    """Execute a routine (supports names with slashes like agent/routine)."""
+    check_server_access(user.id, body.server_name)
+    if body.on_complete not in ON_COMPLETE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"on_complete must be one of {list(ON_COMPLETE_CHOICES)}",
+        )
+    store = get_routine_store()
+    conversation_id = await client.conversation_for_session(body.session_key)
+    on_complete = _bounded_on_complete(body.on_complete, conversation_id)
+    try:
+        instance_id = await store.execute(
+            routine_name=body.routine_name,
+            config=body.config,
+            server_name=body.server_name,
+            user_id=user.id,
+            agent=body.attribute_to,
+            conversation_id=conversation_id,
+            session_key=body.session_key,
+            on_complete=on_complete,
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    # The *bounded* value, not the requested one: a caller told "resume" when
+    # the depth-1 bound already forced "notify" would end its turn waiting for
+    # a wake that is never coming (CORR-287). Mirrors what
+    # ``set_instance_on_complete`` already reports.
+    return {"instance_id": instance_id, "on_complete": on_complete}
+
+
+@router.post("/start")
+async def start_continuous_v2(
+    body: RunRequestV2,
+    user: WebUser = Depends(get_current_user),
+):
+    """Start a continuous routine in this process. Returns instance_id.
+
+    The counterpart of ``/run`` for continuous routines: it exists so a routine
+    an agent starts from chat lives in the main process's store — visible in the
+    dashboard and stoppable from it — instead of dying with the MCP subprocess.
+    """
+    check_server_access(user.id, body.server_name)
+    store = get_routine_store()
+    try:
+        instance_id = await store.start_continuous(
+            routine_name=body.routine_name,
+            config=body.config,
+            server_name=body.server_name,
+            user_id=user.id,
+            agent=body.attribute_to,
+            conversation_id=await client.conversation_for_session(body.session_key),
+            session_key=body.session_key,
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"instance_id": instance_id}
+
+
+@router.post("/schedule")
+async def schedule_routine_v2(
+    body: ScheduleRequestV2,
+    user: WebUser = Depends(get_current_user),
+):
+    """Schedule a routine (supports names with slashes like agent/routine)."""
+    check_server_access(user.id, body.server_name)
+    store = get_routine_store()
+    try:
+        instance_id = await store.schedule(
+            routine_name=body.routine_name,
+            config=body.config,
+            server_name=body.server_name,
+            interval_sec=body.interval_sec,
+            user_id=user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"instance_id": instance_id}
+
+
+@router.post("/instances/{instance_id}/on_complete")
+async def set_instance_on_complete(
+    instance_id: str,
+    body: OnCompleteRequest,
+    user: WebUser = Depends(get_current_user),
+):
+    """Change what the conversation behind a *running* instance gets when it ends.
+
+    The escape hatch for an agent whose blocking ``run`` timed out: rather than
+    poll the instance it asked for, it converts the run it already started into
+    one that wakes it. ``applied`` is false when the run has already finished —
+    the caller reads the result the ordinary way and nobody is woken, which is
+    the whole point of checking the status rather than setting the field blind.
+    """
+    inst = _authorized_instance(instance_id, user)
+    if body.on_complete not in ON_COMPLETE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"on_complete must be one of {list(ON_COMPLETE_CHOICES)}",
+        )
+    requested = _bounded_on_complete(
+        body.on_complete, inst.get("conversation_id") or ""
+    )
+    status = get_routine_store().set_on_complete(instance_id, requested)
+    if status is None:
+        raise HTTPException(404, "Instance not found")
+    return {
+        "instance_id": instance_id,
+        "status": status,
+        "applied": status == "running",
+        "on_complete": requested,
+    }
+
+
+@router.post("/instances/{instance_id}/stop")
+async def stop_instance(instance_id: str, user: WebUser = Depends(get_current_user)):
+    """Stop a running or scheduled instance."""
+    _authorized_instance(instance_id, user)
+    if not get_routine_store().stop(instance_id):
+        raise HTTPException(404, "Instance not found")
+    return {"stopped": True}
+
+
+@router.get("/{routine_name:path}/hooks")
+async def get_hooks(routine_name: str, user: WebUser = Depends(get_current_user)):
+    """Get the caller's post-execution hook config for a routine.
+
+    Hooks are per-owner (SEC-152), so this never exposes another user's
+    delivery destinations: a caller who configured none gets the empty default.
+    """
+    cfg = routine_hooks.load_hooks(routine_name, user.id)
+    return cfg if cfg is not None else routine_hooks._default_config()
+
+
+@router.put("/{routine_name:path}/hooks")
+async def put_hooks(
+    routine_name: str,
+    body: HooksRequest,
+    user: WebUser = Depends(get_current_user),
+):
+    """Save the caller's post-execution hook config for a routine."""
+    try:
+        return routine_hooks.save_hooks(routine_name, body.model_dump(), user.id)
+    except routine_hooks.ForbiddenRecipient as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@router.get("/options/{source}")
+async def get_field_options(
+    source: str,
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Return dynamic options for routine config fields (e.g. controller_configs).
+
+    Server-scoped: ``controller_configs`` reads the named server's controller
+    configs, so the caller must have access to it (SEC-159). ``server`` used to
+    default to ``"local"``; the guard makes it required, which is what the
+    dashboard has always sent anyway.
+    """
+    if source == "controller_configs":
+        try:
+            cm = get_config_manager()
+            client = await cm.get_client(server)
+            if not client:
+                return {"options": []}
+            configs = await client.controllers.list_controller_configs()
+            names = [c.get("id") or c.get("name", "") for c in (configs or [])]
+            return {"options": sorted(n for n in names if n)}
+        except Exception as e:
+            log.warning(f"Failed to fetch controller configs: {e}")
+            return {"options": []}
+    return {"options": []}
+
+
+@router.get("/{routine_name:path}/source")
+async def get_routine_source(
+    routine_name: str,
+    user: WebUser = Depends(get_current_user),
+):
+    """Return the source code of a routine.
+
+    Readable by any approved user, for every agent's routines as well as the
+    general and ``_shared`` libraries (SEC-617). That follows from routine
+    definitions being install-wide — see ``list_routines`` above and the
+    ``routine_store`` module docstring — and not from the confinement below,
+    which answers a different question: ``routine_source_roots()`` is a *path*
+    allowlist stopping ``..`` and symlink escapes out of the dirs discovery
+    reads, never an authorization check. Agent homes stay out of those roots,
+    so a journal or memory store next door is not in scope either way.
+    """
+    store = get_routine_store()
+    all_routines = store._discover_all()
+    routine = all_routines.get(routine_name)
+    if not routine:
+        raise HTTPException(404, "Routine not found")
+    try:
+        source_file = inspect.getfile(routine.run_fn)
+        source_path = Path(source_file).resolve()
+        # CORR-585: confine to the roots discovery actually reads — the general
+        # library, the shared one and each agent's own routines/ — not just a
+        # cwd-relative "routines", which 403'd every agent routine above.
+        if not any(source_path.is_relative_to(r) for r in routine_source_roots()):
+            raise HTTPException(403, "Source not available")
+        source = source_path.read_text()
+        return {"filename": source_path.name, "source": source}
+    except (TypeError, OSError) as e:
+        raise HTTPException(404, f"Source not available: {e}")
+
+
+@router.get("/{routine_name:path}/reports")
+async def get_routine_reports(
+    routine_name: str,
+    limit: int = Query(50, ge=1, le=200),
+    user: WebUser = Depends(get_current_user),
+):
+    """Get reports generated by a specific routine."""
+    # Agent routines are prefixed (e.g. "agent_slug/routine_name") but reports
+    # may be saved with just the base name. Match both.
+    base_name = routine_name.split("/")[-1] if "/" in routine_name else routine_name
+    # SEC-593: scope to the caller before matching. The routine name is a free
+    # string anyone may spell, so this listing is only as private as its owner
+    # filter — the same one ``GET /reports`` applies.
+    reports, total = list_reports(
+        search=base_name, limit=limit, owner_id=report_owner_filter(user)
+    )
+    # Filter to exact source_name match (full prefixed or base name)
+    exact = [r for r in reports if r.get("source_name") in (routine_name, base_name)]
+    return {"reports": exact, "total": len(exact)}

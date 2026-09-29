@@ -1,0 +1,724 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  ArrowLeft,
+  Check,
+  ExternalLink,
+  Key,
+  Loader2,
+  Plus,
+  Star,
+  Wallet,
+} from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import { InlineConfirm } from "@/components/ui/InlineConfirm";
+import { useServer } from "@/hooks/useServer";
+import { OWNER_ONLY_HINT, useServerPermission } from "@/hooks/useServerPermission";
+import { type ConnectorInfo, type CredentialInfo, type GatewayWalletGroup, api } from "@/lib/api";
+import { CREDENTIAL_FIELD_PATTERNS } from "@/lib/credential-fields";
+import { credentialsQuery, gatewayWalletsQuery, invalidateCredentialQueries } from "@/lib/queryClient";
+import { ConnectHyperliquid } from "./ConnectHyperliquid";
+import { ImportGatewayWallet, type WalletChain } from "./ImportGatewayWallet";
+import {
+  connectorDisplayName,
+  connectorDocumentationSlug,
+  friendlyCredentialError,
+  isDemoConnector,
+  type InterfaceLanguage,
+} from "./connectorPresentation";
+
+type Step =
+  | "list"
+  | "select-type"
+  | "select-exchange"
+  | "fill-fields"
+  | "connect-hyperliquid"
+  | "import-wallet";
+
+const isHyperliquid = (name: string) => name.startsWith("hyperliquid");
+
+interface AddFlowState {
+  step: Step;
+  connectorType: string;
+  connectorName: string;
+  walletChain: WalletChain | "";
+  fields: Record<string, unknown>;
+  values: Record<string, string>;
+}
+
+const INITIAL_FLOW: AddFlowState = {
+  step: "list",
+  connectorType: "",
+  connectorName: "",
+  walletChain: "",
+  fields: {},
+  values: {},
+};
+
+const WALLET_CHAINS: { chain: WalletChain; label: string }[] = [
+  { chain: "solana", label: "Solana" },
+  { chain: "ethereum", label: "Ethereum/EVM" },
+];
+
+function isCredentialField(key: string, type?: string): boolean {
+  const haystack = `${key} ${type ?? ""}`.toLowerCase();
+  return CREDENTIAL_FIELD_PATTERNS.some((p) => haystack.includes(p));
+}
+
+export function ApiKeysSettings() {
+  const { i18n } = useTranslation();
+  const language: InterfaceLanguage = i18n.language === "en" ? "en" : "zh-CN";
+  const { server } = useServer();
+  // Credential add/delete is owner-only on the backend (SEC-153), and so are the
+  // Gateway wallet mutations — add, set-default and remove all call `_require_owner`
+  // since SEC-166. Reading the level here does not enforce anything — the API still
+  // answers 403 — it just stops the UI from offering a trader an action that is
+  // going to be refused.
+  const { isOwner } = useServerPermission();
+  const qc = useQueryClient();
+  const [flow, setFlow] = useState<AddFlowState>(INITIAL_FLOW);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDeleteWallet, setConfirmDeleteWallet] = useState<string | null>(null);
+
+  const { data: credsData, isLoading: loadingCreds } = useQuery({
+    ...credentialsQuery(server),
+    queryFn: () => api.getCredentials(server!),
+    enabled: !!server,
+  });
+
+  // Gateway wallets — an error (e.g. Gateway not running) renders as a muted note, not a failure.
+  const { data: walletsData, error: walletsError } = useQuery({
+    ...gatewayWalletsQuery(server),
+    queryFn: () => api.getGatewayWallets(server!),
+    enabled: !!server,
+    retry: false,
+  });
+
+  // Same query key as GatewaySettings so the status is shared across the two tabs.
+  const { data: gatewayStatus } = useQuery({
+    queryKey: ["gateway-status", server],
+    queryFn: () => api.getGatewayStatus(server!),
+    enabled: !!server,
+    retry: false,
+  });
+  const gatewayRunning = gatewayStatus?.running === true;
+
+  const { data: connectorsData, isLoading: loadingConnectors } = useQuery({
+    queryKey: ["settings-connectors", server, flow.connectorType],
+    queryFn: () => api.getAvailableConnectors(server!, flow.connectorType || undefined),
+    enabled: !!server && !!flow.connectorType && flow.step === "select-exchange",
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const { data: configMapData, isLoading: loadingConfigMap } = useQuery({
+    queryKey: ["settings-config-map", server, flow.connectorName],
+    queryFn: () => api.getConnectorConfigMap(server!, flow.connectorName),
+    enabled: !!server && !!flow.connectorName && flow.step === "fill-fields",
+    staleTime: 30 * 60 * 1000,
+  });
+
+  // Warm the config-map cache for the ONE connector the pointer/focus is on, rather
+  // than every connector in the list (PERF-349): /settings/connectors/{name}/config-map
+  // is uncached on the backend, so a whole-list prefetch was 30-40 fresh round trips
+  // for a config map the user was never going to open. Same key and staleTime as the
+  // real query below, so a click after a hover still hits a warm cache.
+  const prefetchConfigMap = useCallback(
+    (name: string) => {
+      if (!server) return;
+      qc.prefetchQuery({
+        queryKey: ["settings-config-map", server, name],
+        queryFn: () => api.getConnectorConfigMap(server, name),
+        staleTime: 30 * 60 * 1000,
+      });
+    },
+    [qc, server],
+  );
+
+  // Adding, deleting or (via ConnectHyperliquid, below) connecting a credential
+  // has to invalidate more than the credential list itself — see
+  // invalidateCredentialQueries (CORR-353).
+  const invalidate = () => invalidateCredentialQueries(qc, server);
+
+  const addMut = useMutation({
+    mutationFn: () =>
+      api.addCredential(server!, {
+        connector_name: flow.connectorName,
+        credentials: flow.values,
+      }),
+    onSuccess: () => { invalidate(); setFlow(INITIAL_FLOW); },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (connector: string) => api.deleteCredential(server!, connector),
+    onSuccess: () => { invalidate(); setConfirmDelete(null); },
+  });
+
+  const invalidateWallets = () =>
+    qc.invalidateQueries({ queryKey: gatewayWalletsQuery(server).queryKey });
+
+  const defaultWalletMut = useMutation({
+    mutationFn: (w: { chain: string; address: string }) => api.setDefaultGatewayWallet(server!, w),
+    onSuccess: invalidateWallets,
+  });
+
+  const deleteWalletMut = useMutation({
+    mutationFn: ({ chain, address }: { chain: string; address: string }) =>
+      api.removeGatewayWallet(server!, chain, address),
+    onSuccess: () => { invalidateWallets(); setConfirmDeleteWallet(null); },
+  });
+
+  const wallets = useMemo(
+    () =>
+      (walletsData?.wallets ?? []).flatMap((group: GatewayWalletGroup) =>
+        (group.walletAddresses ?? []).map((address) => ({
+          chain: group.chain,
+          address,
+          isDefault: address === group.default_address,
+        })),
+      ),
+    [walletsData],
+  );
+
+  // Normalize credentials — API may return strings or objects
+  const credentials: CredentialInfo[] = useMemo(() => {
+    const raw = credsData?.credentials ?? [];
+    return raw.map((item: unknown) => {
+      if (typeof item === "string") {
+        return { connector_name: item, connector_type: "" };
+      }
+      const obj = item as CredentialInfo;
+      return { connector_name: obj.connector_name || "", connector_type: obj.connector_type || "" };
+    });
+  }, [credsData]);
+
+  const grouped = useMemo(() => {
+    const map: Record<string, CredentialInfo[]> = {};
+    for (const c of credentials) {
+      const type = c.connector_type || "other";
+      if (!map[type]) map[type] = [];
+      map[type].push(c);
+    }
+    // Show connectors alphabetically within each group.
+    for (const list of Object.values(map)) {
+      list.sort((a, b) => a.connector_name.localeCompare(b.connector_name));
+    }
+    return map;
+  }, [credentials]);
+
+  // Only treat Hyperliquid as connected once BOTH the spot and perpetual credentials exist. If only
+  // one is present (e.g. a partial-save failure), keep the connect flow available to add the other.
+  const hyperliquidConnected = useMemo(() => {
+    const names = new Set(credentials.map((c) => c.connector_name));
+    return names.has("hyperliquid") && names.has("hyperliquid_perpetual");
+  }, [credentials]);
+
+  // Parse config map fields
+  const configFields = useMemo(() => {
+    if (!configMapData?.config_map) return [];
+    const cm = configMapData.config_map;
+    return Object.entries(cm).map(([key, val]) => {
+      const v = val as Record<string, unknown>;
+      const required = v.required !== false;
+      // `prompt` is the connector's own wording for the field ("Enter your Binance
+      // API key") and says far more than the raw key does; older API servers don't
+      // send it yet, so the label alone has to keep working. When the field is
+      // optional the prompt usually ends in "(optional)" — the badge beside the
+      // label already says that, so don't say it twice.
+      const prompt = ((v.prompt as string) || (v.description as string) || "").trim();
+      return {
+        key,
+        type: (v.type as string) || "string",
+        required,
+        prompt: required ? prompt : prompt.replace(/\s*\(optional\)\s*$/i, ""),
+        isSecret: isCredentialField(key, v.type as string | undefined),
+      };
+    });
+  }, [configMapData]);
+
+  if (!server) {
+    return (
+      <p className="py-8 text-center text-sm text-[var(--color-text-muted)]">
+        Select a server first.
+      </p>
+    );
+  }
+
+  // ── Add credential flow ──
+
+  if (flow.step === "select-type") {
+    return (
+      <div className="space-y-4">
+        <button
+          onClick={() => setFlow(INITIAL_FLOW)}
+          className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back
+        </button>
+        <h3 className="text-sm font-semibold text-[var(--color-text)]">Select Connector Type</h3>
+        <div className="grid grid-cols-2 gap-3">
+          {["spot", "perpetual"].map((type) => (
+            <button
+              key={type}
+              onClick={() => setFlow({ ...flow, step: "select-exchange", connectorType: type })}
+              className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-left transition-colors hover:border-[var(--color-border-hover)]"
+            >
+              <span className="text-sm font-medium capitalize text-[var(--color-text)]">{type}</span>
+              <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+                {type === "spot" ? "Spot exchange connectors" : "Perpetual/futures connectors"}
+              </p>
+            </button>
+          ))}
+        </div>
+
+        <button
+          disabled={hyperliquidConnected}
+          onClick={() =>
+            setFlow({ ...INITIAL_FLOW, step: "connect-hyperliquid", connectorName: "hyperliquid_perpetual" })
+          }
+          className="flex w-full items-center justify-between rounded-lg border border-[#5ce0c6]/40 bg-[#5ce0c6]/5 p-4 text-left transition-colors hover:border-[var(--color-border-hover)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-[#5ce0c6]/40"
+        >
+          <span>
+            <span className="text-sm font-medium text-[var(--color-text)]">Connect Hyperliquid</span>
+            <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+              {hyperliquidConnected
+                ? "Already connected — remove the existing Hyperliquid keys to reconnect."
+                : "Connect wallet to Hyperliquid (spot + perpetual)"}
+            </p>
+          </span>
+          {hyperliquidConnected ? (
+            <Check className="h-7 w-7 shrink-0 text-[var(--color-primary)]" />
+          ) : (
+            <img src="/hyperliquid.png" alt="Hyperliquid" className="h-7 w-7 shrink-0 rounded-full" />
+          )}
+        </button>
+      </div>
+    );
+  }
+
+  if (flow.step === "connect-hyperliquid") {
+    return (
+      <ConnectHyperliquid
+        server={server}
+        onBack={() => setFlow({ ...INITIAL_FLOW, step: "select-type" })}
+        onDone={() => {
+          invalidate();
+          setFlow(INITIAL_FLOW);
+        }}
+      />
+    );
+  }
+
+  // ── Add wallet flow ──
+
+  if (flow.step === "import-wallet" && flow.walletChain) {
+    return (
+      <div className="space-y-4">
+        <button
+          onClick={() => setFlow(INITIAL_FLOW)}
+          className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back
+        </button>
+        <div>
+          <h2 className="text-lg font-semibold text-[var(--color-text)]">Add Wallet to Gateway</h2>
+          <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+            Gateway signs DEX transactions on your server, so it needs the wallet's private key.
+            Browser wallets never share private keys with apps — export the key manually and paste
+            it below.
+          </p>
+        </div>
+
+        {/* Chain tabs */}
+        <div className="flex gap-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-1">
+          {WALLET_CHAINS.map(({ chain, label }) => (
+            <button
+              key={chain}
+              onClick={() => setFlow({ ...flow, walletChain: chain })}
+              className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                flow.walletChain === chain
+                  ? "bg-[var(--color-primary)]/15 text-[var(--color-primary)]"
+                  : "text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <ImportGatewayWallet
+          key={flow.walletChain}
+          server={server}
+          chain={flow.walletChain}
+          onBack={() => setFlow(INITIAL_FLOW)}
+          onDone={() => {
+            invalidateWallets();
+            setFlow(INITIAL_FLOW);
+          }}
+        />
+      </div>
+    );
+  }
+
+  if (flow.step === "select-exchange") {
+    const connectors: ConnectorInfo[] = [...(connectorsData?.connectors ?? [])].sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+    const configuredNames = new Set(credentials.map((c) => c.connector_name));
+    return (
+      <div className="space-y-4">
+        <button
+          onClick={() => setFlow({ ...flow, step: "select-type", connectorType: "" })}
+          className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back
+        </button>
+        <h3 className="text-sm font-semibold text-[var(--color-text)]">
+          Select {flow.connectorType} Exchange
+        </h3>
+        {loadingConnectors ? (
+          <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-text-muted)]">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading connectors...
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {connectors.map((c) => {
+              const alreadyConnected = configuredNames.has(c.name);
+              return (
+                <button
+                  key={c.name}
+                  disabled={alreadyConnected}
+                  onMouseEnter={alreadyConnected ? undefined : () => prefetchConfigMap(c.name)}
+                  onFocus={alreadyConnected ? undefined : () => prefetchConfigMap(c.name)}
+                  onClick={() =>
+                    setFlow({
+                      ...flow,
+                      step: isHyperliquid(c.name) ? "connect-hyperliquid" : "fill-fields",
+                      connectorName: c.name,
+                      values: {},
+                    })
+                  }
+                  className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                    alreadyConnected
+                      ? "border-[var(--color-primary)]/30 bg-[var(--color-primary)]/5 text-[var(--color-text-muted)] cursor-default"
+                      : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text)] hover:border-[var(--color-border-hover)] hover:bg-[var(--color-surface-hover)]"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    {connectorDisplayName(c.name, language)}
+                    {isDemoConnector(c.name) && (
+                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">
+                        {language === "zh-CN" ? "模拟盘" : "DEMO"}
+                      </span>
+                    )}
+                    {alreadyConnected && <Check className="h-3 w-3 text-[var(--color-primary)]" />}
+                  </span>
+                </button>
+              );
+            })}
+            {connectors.length === 0 && (
+              <p className="col-span-full py-4 text-center text-xs text-[var(--color-text-muted)]">
+                No {flow.connectorType} connectors available.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (flow.step === "fill-fields") {
+    return (
+      <div className="space-y-4">
+        <button
+          onClick={() => setFlow({ ...flow, step: "select-exchange", connectorName: "", values: {} })}
+          className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back
+        </button>
+        <h3 className="flex items-center gap-2 text-sm font-semibold text-[var(--color-text)]">
+          {language === "zh-CN" ? "配置" : "Configure"} {connectorDisplayName(flow.connectorName, language)}
+          <a
+            href={`https://hummingbot.org/exchanges/${connectorDocumentationSlug(flow.connectorName)}/#how-to-connect`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 text-xs font-normal text-[var(--color-primary)] hover:underline"
+          >
+            How to connect <ExternalLink className="h-3 w-3" />
+          </a>
+        </h3>
+        {isDemoConnector(flow.connectorName) && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">
+            {language === "zh-CN"
+              ? "这是 OKX 模拟交易环境，只使用虚拟资金，不会操作真实账户。请填写在 OKX 模拟交易页面创建的 API 密钥。"
+              : "This is the OKX demo environment. It uses virtual funds and cannot access your live account. Enter an API key created in OKX Demo Trading."}
+          </div>
+        )}
+        {loadingConfigMap ? (
+          <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-text-muted)]">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading fields...
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {configFields.map((f) => (
+              <div key={f.key}>
+                <label className="mb-0.5 flex items-baseline gap-1.5 text-xs font-medium text-[var(--color-text)]">
+                  {f.key}
+                  {f.required ? (
+                    <span
+                      title="Required"
+                      aria-label="required"
+                      className="text-base font-bold leading-none text-[var(--color-red)]"
+                    >
+                      *
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-normal uppercase tracking-wide text-[var(--color-text-muted)]">
+                      optional
+                    </span>
+                  )}
+                </label>
+                {f.prompt && (
+                  <p className="mb-1.5 text-[11px] leading-snug text-[var(--color-text-muted)]">
+                    {f.prompt}
+                  </p>
+                )}
+                <input
+                  type={f.isSecret ? "password" : "text"}
+                  autoComplete={f.isSecret ? "new-password" : "off"}
+                  value={flow.values[f.key] || ""}
+                  onChange={(e) =>
+                    setFlow({ ...flow, values: { ...flow.values, [f.key]: e.target.value } })
+                  }
+                  className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm text-[var(--color-text)] focus:border-[var(--color-primary)] focus:outline-none"
+                  placeholder={f.isSecret ? "********" : f.key}
+                />
+              </div>
+            ))}
+
+            {configFields.length === 0 && (
+              <p className="text-xs text-[var(--color-text-muted)]">
+                No configuration fields found for this connector.
+              </p>
+            )}
+
+            <div className="flex items-center gap-2 pt-2">
+              <button
+                onClick={() => addMut.mutate()}
+                disabled={addMut.isPending}
+                className="flex items-center gap-1.5 rounded-md bg-[var(--color-primary)] px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/80 disabled:opacity-50"
+              >
+                {addMut.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
+                Add Credential
+              </button>
+              <button
+                onClick={() => setFlow(INITIAL_FLOW)}
+                className="rounded-md px-3 py-1.5 text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)]"
+              >
+                Cancel
+              </button>
+            </div>
+
+            {addMut.error && (
+              <p className="text-xs text-[var(--color-red)]">
+                {friendlyCredentialError(addMut.error.message, flow.connectorName, language)}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Main list ──
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-[var(--color-text-muted)]">
+          {language === "zh-CN"
+            ? `已配置 ${credentials.length} 组 API 密钥${wallets.length > 0 ? `和 ${wallets.length} 个钱包` : ""}`
+            : `${credentials.length} credential${credentials.length !== 1 ? "s" : ""}${wallets.length > 0 ? `, ${wallets.length} wallet${wallets.length !== 1 ? "s" : ""}` : ""} configured`}
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() =>
+              setFlow({ ...INITIAL_FLOW, step: "import-wallet", walletChain: "solana" })
+            }
+            disabled={!gatewayRunning || !isOwner}
+            title={
+              !isOwner
+                ? OWNER_ONLY_HINT
+                : gatewayRunning
+                  ? undefined
+                  : "Gateway is not running — start it from the Gateway tab."
+            }
+            className="flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5 text-xs font-medium text-[var(--color-text)] transition-colors hover:border-[var(--color-border-hover)] hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-[var(--color-border)] disabled:hover:bg-[var(--color-surface)]"
+          >
+            <Wallet className="h-3.5 w-3.5" /> Add Wallet
+          </button>
+          <button
+            onClick={() => setFlow({ ...INITIAL_FLOW, step: "select-type" })}
+            disabled={!isOwner}
+            title={isOwner ? undefined : OWNER_ONLY_HINT}
+            className="flex items-center gap-1.5 rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/80 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-[var(--color-primary)]"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add API Key
+          </button>
+        </div>
+      </div>
+
+      {loadingCreds ? (
+        <div className="flex items-center justify-center py-12 text-[var(--color-text-muted)]">
+          <Loader2 className="h-5 w-5 animate-spin" />
+        </div>
+      ) : credentials.length === 0 ? (
+        <p className="py-8 text-center text-sm text-[var(--color-text-muted)]">
+          No API keys configured. Add one to start trading.
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {Object.entries(grouped)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([type, creds]) => (
+            <div key={type}>
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">
+                {type}
+              </h3>
+              <div className="space-y-2">
+                {creds.map((c) => (
+                  <div
+                    key={c.connector_name}
+                    className="flex items-center justify-between rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 transition-colors hover:border-[var(--color-border-hover)]"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[var(--color-surface-hover)] text-[var(--color-text-muted)]">
+                        <Key className="h-4 w-4" />
+                      </div>
+                      <span className="text-sm font-medium text-[var(--color-text)]">
+                        {connectorDisplayName(c.connector_name, language)}
+                        {isDemoConnector(c.connector_name) && (
+                          <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">
+                            {language === "zh-CN" ? "模拟盘" : "DEMO"}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+
+                    <InlineConfirm
+                      confirming={confirmDelete === c.connector_name}
+                      onRequest={() => setConfirmDelete(c.connector_name)}
+                      onConfirm={() => deleteMut.mutate(c.connector_name)}
+                      onCancel={() => setConfirmDelete(null)}
+                      pending={deleteMut.isPending}
+                      disabled={!isOwner}
+                      triggerLabel={isOwner ? "Delete credential" : OWNER_ONLY_HINT}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* A refusal that slips past the disabled state (stale permission, a race with
+          a revoked share) still has to say something the user can act on — the API's
+          own detail, e.g. "Owner access required", rather than a silent no-op. */}
+      {deleteMut.error && (
+        <p className="text-xs text-[var(--color-red)]">{deleteMut.error.message}</p>
+      )}
+
+      {/* ── Gateway wallets ── */}
+      <div>
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">
+          Wallets
+        </h3>
+        {walletsError ? (
+          <p className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 text-xs text-[var(--color-text-muted)]">
+            Gateway is not reachable — start it from the Gateway tab to manage wallets.
+          </p>
+        ) : wallets.length === 0 ? (
+          <p className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 text-xs text-[var(--color-text-muted)]">
+            No wallets in Gateway. Add one to trade on DEXs.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {wallets.map((w) => {
+              const walletKey = `${w.chain}:${w.address}`;
+              return (
+                <div
+                  key={walletKey}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 transition-colors hover:border-[var(--color-border-hover)]"
+                >
+                  <div className="flex min-w-0 items-center gap-3">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[var(--color-surface-hover)] text-[var(--color-text-muted)]">
+                      <Wallet className="h-4 w-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-medium capitalize text-[var(--color-text)]">
+                          {w.chain}
+                        </span>
+                        {w.isDefault && (
+                          <span
+                            className="flex items-center gap-0.5 rounded bg-[var(--color-primary)]/10 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-primary)]"
+                            title="Default wallet for this chain"
+                          >
+                            <Star className="h-2.5 w-2.5" /> default
+                          </span>
+                        )}
+                      </div>
+                      <p className="truncate font-mono text-xs text-[var(--color-text-muted)]">
+                        {w.address}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1">
+                    {!w.isDefault && confirmDeleteWallet !== walletKey && (
+                      <button
+                        onClick={() =>
+                          defaultWalletMut.mutate({ chain: w.chain, address: w.address })
+                        }
+                        disabled={defaultWalletMut.isPending || !isOwner}
+                        className="rounded p-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+                        title={isOwner ? "Set as default wallet for this chain" : OWNER_ONLY_HINT}
+                      >
+                        <Star className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    <InlineConfirm
+                      confirming={confirmDeleteWallet === walletKey}
+                      onRequest={() => setConfirmDeleteWallet(walletKey)}
+                      onConfirm={() =>
+                        deleteWalletMut.mutate({ chain: w.chain, address: w.address })
+                      }
+                      onCancel={() => setConfirmDeleteWallet(null)}
+                      pending={deleteWalletMut.isPending}
+                      disabled={!isOwner}
+                      triggerLabel={
+                        isOwner ? "Remove wallet from Gateway" : OWNER_ONLY_HINT
+                      }
+                      confirmLabel="Confirm remove"
+                      cancelLabel="Cancel remove"
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {/* Same reasoning as the credential error above: a wallet mutation the API
+            refuses (owner-only since SEC-166) must say so instead of leaving the row
+            untouched and the click unexplained. */}
+        {defaultWalletMut.error && (
+          <p className="mt-2 text-xs text-[var(--color-red)]">{defaultWalletMut.error.message}</p>
+        )}
+        {deleteWalletMut.error && (
+          <p className="mt-2 text-xs text-[var(--color-red)]">{deleteWalletMut.error.message}</p>
+        )}
+      </div>
+    </div>
+  );
+}
