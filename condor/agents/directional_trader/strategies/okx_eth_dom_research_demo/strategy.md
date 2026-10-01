@@ -39,7 +39,8 @@ an immediate marketable limit close. Take-profit orders are post-only maker
 limits; stop-loss and time-limit exits are price-protected limits. No strategy
 entry or exit uses a bare market order. Fee-covered trailing protection remains
 a second profit lock and the bounded structural stop remains the final
-backstop. The executor time limit is 120 seconds.
+backstop. The executor time limit is 120 seconds, and every completed exit
+starts a 20-second cooldown before another entry is permitted.
 If a venue position outlives its executor, the routine adopts that account
 position only after the executor list and active-order list are both empty.
 This single-owner rule prevents delayed fill reporting from submitting two

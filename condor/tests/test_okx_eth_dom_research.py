@@ -45,6 +45,7 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
     assert config.unfilled_shutdown_grace_seconds == 60
     assert config.dust_position_notional_usdt == 5
     assert config.entry_timeout_seconds == 15
+    assert config.exit_cooldown_seconds == 20
     assert ENTRY_ORDER_TYPE == 3
     assert TAKE_PROFIT_ORDER_TYPE == 3
     assert RISK_EXIT_ORDER_TYPE == 2

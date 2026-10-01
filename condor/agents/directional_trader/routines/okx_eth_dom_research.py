@@ -105,7 +105,7 @@ class Config(BaseModel):
     unfilled_shutdown_grace_seconds: float = Field(default=60, ge=30, le=120)
     minimum_hold_seconds: float = Field(default=0.5, ge=0.5, le=10)
     soft_exit_confirmations: int = Field(default=1, ge=1, le=6)
-    exit_cooldown_seconds: float = Field(default=15, ge=5, le=120)
+    exit_cooldown_seconds: float = Field(default=20, ge=5, le=120)
     dust_position_notional_usdt: float = Field(default=5, ge=1, le=20)
     data_dir: str = Field(default="data/research/eth_dom")
 
