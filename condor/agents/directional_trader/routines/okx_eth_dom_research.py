@@ -8,10 +8,11 @@ estimated margin is fixed at one 20% allocation of current demo equity.  The
 routine never scales in: any existing ETH position, active entry order, or
 closing executor blocks a new entry.
 
-The public ``books`` channel is used because it is available without a VIP
-market-data entitlement.  It is a 100 ms class feed, not exchange-colocated
-HFT.  The resulting feature rows are labelled with forward returns and written
-to JSONL so the observations can be analysed before any live deployment.
+The free public ``bbo-tbt`` feed supplies 10 ms-class top-of-book updates while
+``books`` supplies 400-level, 100 ms-class depth.  This is still not
+exchange-colocated HFT.  The resulting feature rows are labelled with forward
+returns and written to JSONL so the observations can be analysed before any
+live deployment.
 """
 
 from __future__ import annotations
@@ -75,6 +76,20 @@ def executor_submission_status(result: dict[str, Any]) -> tuple[bool, str]:
     return True, executor_id
 
 
+def maker_close_price(direction: str, frame: "BookFrame") -> float:
+    """Rest a close on the passive side instead of crossing the spread."""
+    if direction == "LONG":
+        return frame.best_ask
+    if direction == "SHORT":
+        return frame.best_bid
+    raise ValueError(f"unsupported position direction: {direction}")
+
+
+def emergency_exit_reason(reason: str) -> bool:
+    """Identify exits where fill certainty must override maker-fee preference."""
+    return reason in {"defensive account hard-stop", "defensive account time limit"}
+
+
 class Config(BaseModel):
     """ETH-only, demo-only DOM research configuration."""
 
@@ -85,7 +100,7 @@ class Config(BaseModel):
     leverage: int = Field(default=10, ge=10, le=10)
     position_margin_pct: float = Field(default=20, ge=20, le=20)
     max_positions: int = Field(default=1, ge=1, le=1)
-    min_seconds_between_entries: float = Field(default=60, ge=30, le=300)
+    min_seconds_between_entries: float = Field(default=10, ge=5, le=300)
     decision_interval_ms: int = Field(default=250, ge=100, le=2000)
     feature_sample_ms: int = Field(default=1000, ge=250, le=5000)
     book_stale_ms: int = Field(default=750, ge=250, le=5000)
@@ -103,7 +118,7 @@ class Config(BaseModel):
     min_take_profit_pct: float = Field(default=0.18, ge=0.12, le=0.60)
     max_take_profit_pct: float = Field(default=0.60, ge=0.18, le=1.0)
     minimum_reward_risk: float = Field(default=1.20, ge=1.1, le=2.0)
-    time_limit_seconds: int = Field(default=120, ge=30, le=300)
+    time_limit_seconds: int = Field(default=30, ge=15, le=300)
     default_fee_rate_pct: float = Field(default=0.05, gt=0, le=0.2)
     break_even_buffer_pct: float = Field(default=0.01, ge=0.01, le=0.20)
     trailing_delta_stop_ratio: float = Field(default=0.50, ge=0.20, le=1.0)
@@ -112,11 +127,11 @@ class Config(BaseModel):
     retail_stop_lookback_seconds: float = Field(default=30, ge=10, le=120)
     retail_stop_recent_seconds: float = Field(default=3, ge=1, le=10)
     retail_stop_excursion_bps: float = Field(default=0.75, ge=0.25, le=5)
-    entry_timeout_seconds: float = Field(default=15, ge=10, le=30)
-    unfilled_shutdown_grace_seconds: float = Field(default=60, ge=30, le=120)
+    entry_timeout_seconds: float = Field(default=5, ge=2, le=30)
+    unfilled_shutdown_grace_seconds: float = Field(default=10, ge=5, le=120)
     minimum_hold_seconds: float = Field(default=0.5, ge=0.5, le=10)
     soft_exit_confirmations: int = Field(default=1, ge=1, le=6)
-    exit_cooldown_seconds: float = Field(default=20, ge=5, le=120)
+    exit_cooldown_seconds: float = Field(default=5, ge=2, le=120)
     dust_position_notional_usdt: float = Field(default=5, ge=1, le=20)
     data_dir: str = Field(default="data/research/eth_dom")
 
@@ -192,6 +207,11 @@ class DomState:
         walls: dict[tuple[str, float], WallState] | None = None,
         last_seq_id: int | None = None,
         last_book_time: float = 0.0,
+        bbo_bid: float = 0.0,
+        bbo_ask: float = 0.0,
+        bbo_bid_size: float = 0.0,
+        bbo_ask_size: float = 0.0,
+        last_bbo_time: float = 0.0,
         reconnects: int = 0,
     ) -> None:
         self.bids = bids if bids is not None else {}
@@ -201,6 +221,11 @@ class DomState:
         self.walls = walls if walls is not None else {}
         self.last_seq_id = last_seq_id
         self.last_book_time = last_book_time
+        self.bbo_bid = bbo_bid
+        self.bbo_ask = bbo_ask
+        self.bbo_bid_size = bbo_bid_size
+        self.bbo_ask_size = bbo_ask_size
+        self.last_bbo_time = last_bbo_time
         self.reconnects = reconnects
 
     def reset_book(self) -> None:
@@ -217,6 +242,20 @@ class DomState:
             self.trades.append(
                 {"price": price, "size": size, "side": side, "time": timestamp}
             )
+
+    def apply_bbo(self, message: dict[str, Any]) -> None:
+        """Record OKX's free 10 ms best-bid/offer snapshot."""
+        for data in message.get("data", []):
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if bids and len(bids[0]) >= 2:
+                self.bbo_bid = _number(bids[0][0])
+                self.bbo_bid_size = _number(bids[0][1])
+            if asks and len(asks[0]) >= 2:
+                self.bbo_ask = _number(asks[0][0])
+                self.bbo_ask_size = _number(asks[0][1])
+            if self.bbo_bid > 0 and self.bbo_ask > self.bbo_bid:
+                self.last_bbo_time = time.time()
 
     def apply_book(self, message: dict[str, Any]) -> None:
         action = str(message.get("action") or "update")
@@ -283,6 +322,16 @@ class DomState:
             return None
         best_bid, bid_q = bids[0]
         best_ask, ask_q = asks[0]
+        frame_time = now or time.time()
+        if (
+            frame_time - self.last_bbo_time <= 0.5
+            and self.bbo_bid > 0
+            and self.bbo_ask > self.bbo_bid
+        ):
+            best_bid = self.bbo_bid
+            best_ask = self.bbo_ask
+            bid_q = self.bbo_bid_size or bid_q
+            ask_q = self.bbo_ask_size or ask_q
         mid = (best_bid + best_ask) / 2
         bid_depth = sum(size for _, size in bids)
         ask_depth = sum(size for _, size in asks)
@@ -293,7 +342,7 @@ class DomState:
             if bid_q + ask_q > 0
             else mid
         )
-        return BookFrame(now or time.time(), mid, best_bid, best_ask, obi, microprice)
+        return BookFrame(frame_time, mid, best_bid, best_ask, obi, microprice)
 
     def recent_trade_flow(self, seconds: float = 2.0) -> dict[str, float]:
         cutoff = time.time() - seconds
@@ -1013,6 +1062,7 @@ async def _dom_stream(state: DomState) -> None:
                         {
                             "op": "subscribe",
                             "args": [
+                                {"channel": "bbo-tbt", "instId": INST_ID},
                                 {"channel": "books", "instId": INST_ID},
                                 {"channel": "trades", "instId": INST_ID},
                             ],
@@ -1030,6 +1080,8 @@ async def _dom_stream(state: DomState) -> None:
                             except RuntimeError:
                                 state.reset_book()
                                 raise
+                        elif channel == "bbo-tbt":
+                            state.apply_bbo(payload)
                         elif channel == "trades":
                             for trade in payload.get("data", []):
                                 state.add_trade(trade)
@@ -1410,7 +1462,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         # Detach the position without letting the executor use
                         # its default market close. Once its existing child
                         # orders are gone, the state machine below submits one
-                        # price-protected, marketable LIMIT close.
+                        # passive LIMIT_MAKER close.
                         if executor_id not in manual_limit_exits:
                             await client.executors.stop_executor(
                                 executor_id=executor_id, keep_position=True
@@ -1441,7 +1493,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     if executor_id not in active_ids:
                         exit_trackers.pop(executor_id, None)
 
-                # Complete a profitable anomaly exit with one marketable LIMIT
+                # Complete a profitable anomaly exit with one passive maker
                 # order only after the executor's own child orders have
                 # disappeared. The submitted flag prevents retries while the
                 # connector's order/position views catch up.
@@ -1455,9 +1507,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             and not request.get("submitted")
                             and not account_active_orders
                         ):
-                            limit_price = (
-                                frame.best_bid if direction == "LONG" else frame.best_ask
-                            )
+                            limit_price = maker_close_price(direction, frame)
                             await retry_network_call(
                                 lambda: client.trading.place_order(
                                     account_name=config.account_name,
@@ -1467,7 +1517,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                         "SELL" if direction == "LONG" else "BUY"
                                     ),
                                     amount=abs(_number(position.get("amount"))),
-                                    order_type="LIMIT",
+                                    order_type="LIMIT_MAKER",
                                     price=limit_price,
                                     position_action="CLOSE",
                                 )
@@ -1590,6 +1640,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         elif held_seconds >= config.time_limit_seconds:
                             reason = "defensive account time limit"
                         if reason and now >= account_exit_pending_until:
+                            is_emergency = emergency_exit_reason(reason)
+                            close_order_type = "MARKET" if is_emergency else "LIMIT_MAKER"
+                            close_price = (
+                                None
+                                if is_emergency
+                                else maker_close_price(direction, frame)
+                            )
                             await retry_network_call(
                                 lambda: client.trading.place_order(
                                     account_name=config.account_name,
@@ -1599,12 +1656,8 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                         "SELL" if direction == "LONG" else "BUY"
                                     ),
                                     amount=abs(_number(position.get("amount"))),
-                                    order_type="LIMIT",
-                                    price=(
-                                        frame.best_bid
-                                        if direction == "LONG"
-                                        else frame.best_ask
-                                    ),
+                                    order_type=close_order_type,
+                                    price=close_price,
                                     position_action="CLOSE",
                                 )
                             )
@@ -1770,7 +1823,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 report.builder.manual_order()
                 report.builder.kpi("Mode", "DEMO ONLY")
                 report.builder.kpi("Pair", PAIR)
-                report.builder.kpi("Feed", "OKX books 100ms class")
+                report.builder.kpi("Feed", "OKX bbo-tbt 10ms + books 100ms")
                 report.builder.kpi("Signal", last_signal)
                 report.builder.kpi(
                     "Position mode", "ONE SHOT · 20% MARGIN · NO SCALE-IN"

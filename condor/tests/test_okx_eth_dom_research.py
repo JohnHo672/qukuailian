@@ -17,6 +17,7 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     dynamic_barriers,
     depth_limited_margin,
     detect_retail_stop_run,
+    emergency_exit_reason,
     executor_direction,
     executor_lifecycle,
     executor_submission_status,
@@ -24,6 +25,7 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     fee_covered_trailing_barrier,
     infer_dom_intent,
     market_depth_metrics,
+    maker_close_price,
     one_shot_position_margin,
     pair_active_order_rows,
     pair_position_rows,
@@ -41,12 +43,12 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
     assert config.leverage == 10
     assert config.position_margin_pct == 20
     assert config.max_positions == 1
-    assert config.time_limit_seconds == 120
-    assert config.min_seconds_between_entries == 60
-    assert config.unfilled_shutdown_grace_seconds == 60
+    assert config.time_limit_seconds == 30
+    assert config.min_seconds_between_entries == 10
+    assert config.unfilled_shutdown_grace_seconds == 10
     assert config.dust_position_notional_usdt == 5
-    assert config.entry_timeout_seconds == 15
-    assert config.exit_cooldown_seconds == 20
+    assert config.entry_timeout_seconds == 5
+    assert config.exit_cooldown_seconds == 5
     assert ENTRY_ORDER_TYPE == 3
     assert TAKE_PROFIT_ORDER_TYPE == 3
     assert RISK_EXIT_ORDER_TYPE == 1
@@ -115,6 +117,37 @@ def test_incremental_book_and_microprice_are_maintained():
     assert frame.best_ask == 2000.5
     assert frame.obi > 0
     assert frame.microprice > frame.mid
+
+
+def test_free_ten_millisecond_bbo_overlays_the_deeper_book():
+    state = DomState(
+        bids={1999.0: 10.0, 1998.0: 5.0},
+        asks={2001.0: 10.0, 2002.0: 5.0},
+    )
+    state.apply_bbo(
+        {
+            "data": [
+                {
+                    "bids": [["1999.5", "4"]],
+                    "asks": [["2000.5", "6"]],
+                }
+            ]
+        }
+    )
+    frame = state.book_frame()
+    assert frame is not None
+    assert frame.best_bid == 1999.5
+    assert frame.best_ask == 2000.5
+    assert frame.mid == 2000.0
+
+
+def test_profitable_close_rests_on_the_passive_side():
+    frame = BookFrame(time.time(), 2000, 1999.5, 2000.5, 0, 2000)
+    assert maker_close_price("LONG", frame) == 2000.5
+    assert maker_close_price("SHORT", frame) == 1999.5
+    assert emergency_exit_reason("defensive account hard-stop") is True
+    assert emergency_exit_reason("defensive account time limit") is True
+    assert emergency_exit_reason("retail short-stop pool reached") is False
 
 
 def test_persistent_replenished_wall_scores_as_intent_not_a_claim():
