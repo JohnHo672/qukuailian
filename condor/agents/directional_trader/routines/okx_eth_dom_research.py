@@ -61,7 +61,18 @@ INST_ID = "ETH-USDT-SWAP"
 CONTRACT_VALUE_BASE = 0.1  # OKX public instrument metadata: 1 contract = 0.1 ETH
 ENTRY_ORDER_TYPE = 3  # LIMIT_MAKER: retain price control for scalp entries
 TAKE_PROFIT_ORDER_TYPE = 3  # LIMIT_MAKER: collect rather than cross when possible
-RISK_EXIT_ORDER_TYPE = 2  # LIMIT: price-protected, marketable risk exit
+RISK_EXIT_ORDER_TYPE = 1  # MARKET: required by PositionExecutor for SL/time-limit safety
+
+
+def executor_submission_status(result: dict[str, Any]) -> tuple[bool, str]:
+    """Return a truthful executor submission status for reports and throttling."""
+    error = str(result.get("error") or "").strip()
+    if error:
+        return False, error
+    executor_id = str(result.get("executor_id") or "").strip()
+    if not executor_id:
+        return False, "execution API returned no executor_id"
+    return True, executor_id
 
 
 class Config(BaseModel):
@@ -1740,15 +1751,17 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 controller_id=config.controller_id,
                             )
                         )
-                        last_trailing = trailing
+                        submitted, submission_detail = executor_submission_status(result)
+                        if submitted:
+                            last_trailing = trailing
                         last_entry_at = now
                         events.append(
                             {
                                 "Time": time.strftime("%H:%M:%S"),
-                                "Action": "ENTRY",
+                                "Action": "ENTRY" if submitted else "ENTRY REJECTED",
                                 "Side": direction,
                                 "Margin": f"{position_margin:.2f} / {equity * 0.20:.2f}",
-                                "Reason": f"DOM {signal['score']}/7; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {result.get('executor_id', 'submitted')}",
+                                "Reason": f"DOM {signal['score']}/7; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {submission_detail}",
                             }
                         )
 

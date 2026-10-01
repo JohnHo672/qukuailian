@@ -19,6 +19,7 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     detect_retail_stop_run,
     executor_direction,
     executor_lifecycle,
+    executor_submission_status,
     favorable_move_pct,
     fee_covered_trailing_barrier,
     infer_dom_intent,
@@ -48,7 +49,7 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
     assert config.exit_cooldown_seconds == 20
     assert ENTRY_ORDER_TYPE == 3
     assert TAKE_PROFIT_ORDER_TYPE == 3
-    assert RISK_EXIT_ORDER_TYPE == 2
+    assert RISK_EXIT_ORDER_TYPE == 1
     for unsafe in (
         {"connector_name": "okx_perpetual"},
         {"trading_pair": "BTC-USDT"},
@@ -62,6 +63,22 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
             pass
         else:
             raise AssertionError(f"unsafe config accepted: {unsafe}")
+
+
+def test_executor_submission_status_never_labels_backend_errors_as_submitted():
+    accepted, detail = executor_submission_status(
+        {"error": "Invalid executor config: stop loss must be MARKET"}
+    )
+    assert accepted is False
+    assert detail == "Invalid executor config: stop loss must be MARKET"
+
+    accepted, detail = executor_submission_status({"executor_id": "exec-123"})
+    assert accepted is True
+    assert detail == "exec-123"
+
+    accepted, detail = executor_submission_status({})
+    assert accepted is False
+    assert detail == "execution API returned no executor_id"
 
 
 def test_incremental_book_and_microprice_are_maintained():
