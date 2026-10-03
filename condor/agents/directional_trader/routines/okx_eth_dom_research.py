@@ -118,9 +118,6 @@ class Config(BaseModel):
     volume_sync_window_seconds: float = Field(default=2, ge=1, le=10)
     min_volume_acceleration_ratio: float = Field(default=1.05, ge=1, le=3)
     min_price_sync_bps: float = Field(default=0.25, ge=0.05, le=5)
-    breakout_volume_ratio: float = Field(default=1.30, ge=1.10, le=4)
-    min_range_width_bps: float = Field(default=12, ge=6, le=50)
-    range_edge_tolerance_bps: float = Field(default=2, ge=0.5, le=6)
     min_iceberg_score: float = Field(default=0.35, ge=0.1, le=0.95)
     min_stop_pct: float = Field(default=0.05, ge=0.03, le=0.10)
     early_invalidation_stop_pct: float = Field(default=0.06, ge=0.04, le=0.10)
@@ -773,7 +770,6 @@ def maker_entry_price(
     intent: dict[str, Any],
     rules: dict[str, Any],
     max_offset_bps: float,
-    strategy: str = "TREND_PULLBACK",
 ) -> float:
     """Choose the nearest passive VWAP/VP/wall level for a maker entry."""
     if direction not in {"LONG", "SHORT"} or max_offset_bps <= 0:
@@ -781,16 +777,9 @@ def maker_entry_price(
     tick = _number(rules.get("min_price_increment"))
     if direction == "LONG":
         lower_bound = frame.best_bid * (1 - max_offset_bps / 10_000)
-        breakout_retest = vah if strategy == "BREAKOUT_RETEST" else 0.0
         supports = [
             level
-            for level in (
-                vwap,
-                poc,
-                val,
-                breakout_retest,
-                _number(intent.get("bid_wall_price")),
-            )
+            for level in (vwap, poc, val, _number(intent.get("bid_wall_price")))
             if lower_bound <= level <= frame.best_bid
         ]
         candidate = max(supports) if supports else frame.best_bid
@@ -805,16 +794,9 @@ def maker_entry_price(
         return min(candidate, frame.best_bid)
 
     upper_bound = frame.best_ask * (1 + max_offset_bps / 10_000)
-    breakout_retest = val if strategy == "BREAKOUT_RETEST" else 0.0
     resistances = [
         level
-        for level in (
-            vwap,
-            poc,
-            vah,
-            breakout_retest,
-            _number(intent.get("ask_wall_price")),
-        )
+        for level in (vwap, poc, vah, _number(intent.get("ask_wall_price")))
         if frame.best_ask <= level <= upper_bound
     ]
     candidate = min(resistances) if resistances else frame.best_ask
@@ -926,193 +908,6 @@ def dom_signal(
     }
 
 
-def classify_market_regime(
-    *,
-    frame: BookFrame,
-    depth: dict[str, float],
-    structure: dict[str, Any],
-    volume_price: dict[str, float | str],
-    liquidity_void: str,
-    config: Config,
-) -> dict[str, str | float]:
-    """Route the current microstructure into one execution playbook."""
-    trend = str(structure.get("trend") or "FLAT")
-    volume_direction = str(volume_price.get("direction") or "FLAT")
-    volume_ratio = _number(volume_price.get("volume_ratio"))
-    val = _number(structure.get("val"))
-    vah = _number(structure.get("vah"))
-    profile_width_bps = (
-        (vah / val - 1) * 10_000 if val > 0 and vah >= val else 0.0
-    )
-    depth_imbalance = depth.get("depth_imbalance_10bps", 0.0)
-
-    if (
-        trend == "UP"
-        and volume_direction == "UP"
-        and liquidity_void == "UP"
-        and depth_imbalance >= config.min_depth_imbalance
-    ):
-        breakout = vah > 0 and frame.mid >= vah and volume_ratio >= config.breakout_volume_ratio
-        return {
-            "regime": "BREAKOUT_UP" if breakout else "TREND_UP",
-            "strategy": "BREAKOUT_RETEST" if breakout else "TREND_PULLBACK",
-            "bias": "LONG",
-            "profile_width_bps": profile_width_bps,
-        }
-    if (
-        trend == "DOWN"
-        and volume_direction == "DOWN"
-        and liquidity_void == "DOWN"
-        and depth_imbalance <= -config.min_depth_imbalance
-    ):
-        breakout = val > 0 and frame.mid <= val and volume_ratio >= config.breakout_volume_ratio
-        return {
-            "regime": "BREAKOUT_DOWN" if breakout else "TREND_DOWN",
-            "strategy": "BREAKOUT_RETEST" if breakout else "TREND_PULLBACK",
-            "bias": "SHORT",
-            "profile_width_bps": profile_width_bps,
-        }
-    if (
-        trend == "FLAT"
-        and volume_direction == "FLAT"
-        and liquidity_void == "NONE"
-        and profile_width_bps >= config.min_range_width_bps
-    ):
-        return {
-            "regime": "BALANCED_RANGE",
-            "strategy": "VP_EDGE_REVERSION",
-            "bias": "BOTH",
-            "profile_width_bps": profile_width_bps,
-        }
-    return {
-        "regime": "NO_TRADE",
-        "strategy": "WAIT",
-        "bias": "FLAT",
-        "profile_width_bps": profile_width_bps,
-    }
-
-
-def range_reversion_signal(
-    *,
-    frame: BookFrame,
-    flow: dict[str, float],
-    intent: dict[str, Any],
-    structure: dict[str, Any],
-    volume_price: dict[str, float | str],
-    config: Config,
-) -> dict[str, Any]:
-    """Fade only a defended VP edge; never fade expanding directional flow."""
-    val = _number(structure.get("val"))
-    vah = _number(structure.get("vah"))
-    tolerance = config.range_edge_tolerance_bps / 10_000
-    micro_bps = (frame.microprice / frame.mid - 1) * 10_000
-    long_checks = {
-        "at_val": val > 0 and val * (1 - tolerance) <= frame.mid <= val * (1 + tolerance),
-        "rebound_book": frame.obi >= config.min_obi and micro_bps > 0,
-        "taker_reversal": flow["buy_ratio"] >= config.min_taker_ratio,
-        "defended_edge": intent.get("bid_intent", 0) >= config.min_intent_score,
-        "not_spoof": intent.get("bid_spoof_risk", 1) <= config.max_spoof_risk,
-        "no_down_expansion": volume_price.get("direction") != "DOWN",
-    }
-    short_checks = {
-        "at_vah": vah > 0 and vah * (1 - tolerance) <= frame.mid <= vah * (1 + tolerance),
-        "rejection_book": frame.obi <= -config.min_obi and micro_bps < 0,
-        "taker_reversal": flow["sell_ratio"] >= config.min_taker_ratio,
-        "defended_edge": intent.get("ask_intent", 0) >= config.min_intent_score,
-        "not_spoof": intent.get("ask_spoof_risk", 1) <= config.max_spoof_risk,
-        "no_up_expansion": volume_price.get("direction") != "UP",
-    }
-    long_score = sum(long_checks.values())
-    short_score = sum(short_checks.values())
-    direction = "FLAT"
-    checks: dict[str, bool] = {}
-    if all(long_checks.values()) and long_score > short_score:
-        direction, checks = "LONG", long_checks
-    elif all(short_checks.values()) and short_score > long_score:
-        direction, checks = "SHORT", short_checks
-    return {
-        "direction": direction,
-        "score": max(long_score, short_score),
-        "microprice_bps": micro_bps,
-        "checks": checks,
-        "long_score": long_score,
-        "short_score": short_score,
-    }
-
-
-def adaptive_market_signal(
-    *,
-    frame: BookFrame,
-    flow: dict[str, float],
-    intent: dict[str, Any],
-    depth: dict[str, float],
-    sweep: dict[str, bool],
-    structure: dict[str, Any],
-    volume_price: dict[str, float | str],
-    config: Config,
-) -> dict[str, Any]:
-    """Select exactly one strategy from the live market regime."""
-    liquidity_void = liquidity_void_direction(
-        depth, max_near_concentration=config.max_near_depth_concentration
-    )
-    route = classify_market_regime(
-        frame=frame,
-        depth=depth,
-        structure=structure,
-        volume_price=volume_price,
-        liquidity_void=liquidity_void,
-        config=config,
-    )
-    strategy = str(route["strategy"])
-    if strategy == "VP_EDGE_REVERSION":
-        signal = range_reversion_signal(
-            frame=frame,
-            flow=flow,
-            intent=intent,
-            structure=structure,
-            volume_price=volume_price,
-            config=config,
-        )
-    elif strategy in {"TREND_PULLBACK", "BREAKOUT_RETEST"}:
-        signal = dom_signal(
-            frame=frame,
-            flow=flow,
-            intent=intent,
-            depth=depth,
-            sweep=sweep,
-            vwap=_number(structure.get("vwap")),
-            poc=_number(structure.get("poc")),
-            val=_number(structure.get("val")),
-            vah=_number(structure.get("vah")),
-            trend=str(structure.get("trend") or "FLAT"),
-            volume_price=volume_price,
-            config=config,
-        )
-        # Breakout entries rest at the retest level instead of chasing the
-        # impulse. Direction still comes from the full DOM confirmation set.
-        if strategy == "BREAKOUT_RETEST" and signal["direction"] == "FLAT":
-            signal["checks"] = {}
-    else:
-        signal = {
-            "direction": "FLAT",
-            "score": 0,
-            "microprice_bps": (frame.microprice / frame.mid - 1) * 10_000,
-            "checks": {},
-            "long_score": 0,
-            "short_score": 0,
-        }
-    return {**signal, **route, "liquidity_void": liquidity_void}
-
-
-def strategy_loss_limits(strategy: str, config: Config) -> tuple[float, float]:
-    """Return early/hard price-stop percentages for the selected playbook."""
-    if strategy == "VP_EDGE_REVERSION":
-        return min(config.early_invalidation_stop_pct, 0.04), min(config.max_stop_pct, 0.06)
-    if strategy == "BREAKOUT_RETEST":
-        return min(config.early_invalidation_stop_pct, 0.05), min(config.max_stop_pct, 0.08)
-    return config.early_invalidation_stop_pct, config.max_stop_pct
-
-
 def dynamic_barriers(
     *,
     direction: str,
@@ -1145,25 +940,6 @@ def dynamic_barriers(
         target_pct, config.min_take_profit_pct, config.max_take_profit_pct
     )
     return {"stop_loss_pct": stop_pct, "take_profit_pct": take_profit_pct}
-
-
-def strategy_adjusted_barriers(
-    strategy: str, barriers: dict[str, float], config: Config
-) -> dict[str, float]:
-    """Apply strategy-specific risk without exceeding global safety limits."""
-    _, hard_stop = strategy_loss_limits(strategy, config)
-    stop = min(barriers["stop_loss_pct"], hard_stop)
-    target = barriers["take_profit_pct"]
-    if strategy == "BREAKOUT_RETEST":
-        target = max(target, stop * 1.8)
-    elif strategy == "VP_EDGE_REVERSION":
-        target = min(max(target, stop * 1.3), 0.30)
-    return {
-        "stop_loss_pct": stop,
-        "take_profit_pct": _clamp(
-            target, config.min_take_profit_pct, config.max_take_profit_pct
-        ),
-    }
 
 
 def fee_covered_trailing_barrier(
@@ -1266,17 +1042,6 @@ def executor_direction(row: dict[str, Any]) -> str | None:
     if value in {"2", "2.0", "SELL", "SHORT"} or value.endswith(".SELL"):
         return "SHORT"
     return None
-
-
-def executor_strategy(row: dict[str, Any]) -> str:
-    """Recover the regime playbook encoded into a position executor."""
-    config = row.get("config") if isinstance(row.get("config"), dict) else {}
-    level_id = str(config.get("level_id") or row.get("level_id") or "").lower()
-    if "breakout-retest" in level_id:
-        return "BREAKOUT_RETEST"
-    if "vp-edge-reversion" in level_id:
-        return "VP_EDGE_REVERSION"
-    return "TREND_PULLBACK"
 
 
 def executor_entry_price(row: dict[str, Any]) -> float:
@@ -1891,7 +1656,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     orphan_order_cancel_requests: set[str] = set()
     shutdown_seen_at: dict[str, float] = {}
     last_signal = "FLAT"
-    last_strategy = "WAIT"
     last_trailing = {
         "activation_pct": 0.0,
         "trailing_delta_pct": 0.0,
@@ -1943,13 +1707,17 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     excursion_bps=config.retail_stop_excursion_bps,
                     now=now,
                 )
-                signal = adaptive_market_signal(
+                signal = dom_signal(
                     frame=frame,
                     flow=flow,
                     intent=intent,
                     depth=depth,
                     sweep=sweep,
-                    structure=structure,
+                    vwap=structure["vwap"],
+                    poc=structure["poc"],
+                    val=structure["val"],
+                    vah=structure["vah"],
+                    trend=str(structure["trend"]),
                     volume_price=volume_price,
                     config=config,
                 )
@@ -1999,8 +1767,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             "retail_stop_prior_high": retail_stop_run["prior_high"],
                             "retail_stop_prior_low": retail_stop_run["prior_low"],
                             "signal": signal["direction"],
-                            "market_regime": signal["regime"],
-                            "selected_strategy": signal["strategy"],
                             **intent,
                         }
                     )
@@ -2114,7 +1880,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 for row in active:
                     executor_id = str(row.get("id") or row.get("executor_id") or "")
                     direction = executor_direction(row)
-                    position_strategy = executor_strategy(row)
                     if not executor_id or direction is None:
                         continue
                     active_ids.add(executor_id)
@@ -2210,14 +1975,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         minimum_hold_seconds=config.minimum_hold_seconds,
                     )
                     held_seconds = now - _number(tracker.get("filled_since"))
-                    early_stop, hard_stop = strategy_loss_limits(
-                        position_strategy, config
-                    )
                     loss_reason = losing_trade_exit_reason(
                         candidate_reason=candidate,
                         current_gross_pct=current_gross_pct,
-                        early_invalidation_stop_pct=early_stop,
-                        max_stop_pct=hard_stop,
+                        early_invalidation_stop_pct=(
+                            config.early_invalidation_stop_pct
+                        ),
+                        max_stop_pct=config.max_stop_pct,
                     )
                     if loss_reason:
                         reason = loss_reason
@@ -2368,11 +2132,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         if account_exit_tracker.get("key") != tracker_key:
                             account_exit_tracker = {
                                 "key": tracker_key,
-                                "strategy": (
-                                    last_strategy
-                                    if last_strategy != "WAIT"
-                                    else "TREND_PULLBACK"
-                                ),
                                 "first_seen": now,
                                 "peak_gross_pct": 0.0,
                                 "candidate_reason": None,
@@ -2434,18 +2193,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             held_seconds=held_seconds,
                             minimum_hold_seconds=config.minimum_hold_seconds,
                         )
-                        position_strategy = str(
-                            account_exit_tracker.get("strategy")
-                            or "TREND_PULLBACK"
-                        )
-                        early_stop, hard_stop = strategy_loss_limits(
-                            position_strategy, config
-                        )
                         loss_reason = losing_trade_exit_reason(
                             candidate_reason=candidate,
                             current_gross_pct=current_gross_pct,
-                            early_invalidation_stop_pct=early_stop,
-                            max_stop_pct=hard_stop,
+                            early_invalidation_stop_pct=(
+                                config.early_invalidation_stop_pct
+                            ),
+                            max_stop_pct=config.max_stop_pct,
                         )
                         if loss_reason:
                             reason = loss_reason
@@ -2554,7 +2308,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         can_enter = False
                 if can_enter:
                     direction = signal["direction"]
-                    selected_strategy = str(signal["strategy"])
                     barriers = dynamic_barriers(
                         direction=direction,
                         price=frame.mid,
@@ -2564,9 +2317,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         vah=structure["vah"],
                         intent=intent,
                         config=config,
-                    )
-                    barriers = strategy_adjusted_barriers(
-                        selected_strategy, barriers, config
                     )
                     trailing = fee_covered_trailing_barrier(
                         structural_stop_pct=barriers["stop_loss_pct"],
@@ -2625,7 +2375,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             intent=intent,
                             rules=rules,
                             max_offset_bps=config.max_entry_extension_bps,
-                            strategy=selected_strategy,
                         )
                         result = await retry_network_call(
                             lambda: executor_create.create_position_executor(
@@ -2637,10 +2386,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 entry_price=entry_price,
                                 leverage=config.leverage,
                                 **maker_only_executor_barrier_kwargs(),
-                                level_id=(
-                                    "eth-dom-"
-                                    + selected_strategy.lower().replace("_", "-")
-                                ),
+                                level_id="eth-dom-research",
                                 account_name=config.account_name,
                                 controller_id=config.controller_id,
                             )
@@ -2648,7 +2394,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         submitted, submission_detail = executor_submission_status(result)
                         if submitted:
                             last_trailing = trailing
-                            last_strategy = selected_strategy
                         last_entry_at = now
                         events.append(
                             {
@@ -2656,7 +2401,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 "Action": "ENTRY" if submitted else "ENTRY REJECTED",
                                 "Side": direction,
                                 "Margin": f"{position_margin:.2f} / {equity * 0.20:.2f}",
-                                "Reason": f"{signal['regime']} -> {selected_strategy}; score {signal['score']}; maker {entry_price:.2f}; tape {structure['trend']} {structure['trend_slope_bps']:+.2f}bps; volume-price {volume_price['direction']} {volume_price['price_change_bps']:+.2f}bps x{volume_price['volume_ratio']:.2f}; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {submission_detail}",
+                                "Reason": f"DOM {signal['score']}/10; maker {entry_price:.2f}; tape {structure['trend']} {structure['trend_slope_bps']:+.2f}bps; volume-price {volume_price['direction']} {volume_price['price_change_bps']:+.2f}bps x{volume_price['volume_ratio']:.2f}; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {submission_detail}",
                             }
                         )
 
@@ -2667,8 +2412,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 report.builder.kpi("Pair", PAIR)
                 report.builder.kpi("Feed", "OKX bbo-tbt 10ms + books 100ms")
                 report.builder.kpi("Signal", last_signal)
-                report.builder.kpi("Market regime", str(signal["regime"]))
-                report.builder.kpi("Selected strategy", str(signal["strategy"]))
                 report.builder.kpi(
                     "Tape trend",
                     f"{structure['trend']} · rolling prints · {structure['trend_slope_bps']:+.2f} bps",
