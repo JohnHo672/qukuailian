@@ -24,6 +24,7 @@ import os
 import statistics
 import time
 from collections import defaultdict, deque
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Deque
 
@@ -36,19 +37,13 @@ from agents.directional_trader.routines.okx_alt_hft_demo import (
     _ensure_initialized_client,
     _executor_rows,
     _number,
-    _okx_candles,
-    _stop_active,
     cap_amount_to_exchange_max,
     observed_fee_rates,
     performance_summary,
     quantize_amount,
     retry_network_call,
 )
-from agents.directional_trader.routines.okx_alt_orderflow_scan import (
-    _normalize_candles,
-    candle_vwap,
-    trade_volume_profile_levels,
-)
+from agents.directional_trader.routines.okx_alt_orderflow_scan import trade_volume_profile_levels
 from condor.reports import LiveReport
 from config_manager import get_client
 from mcp_servers.hummingbot_api.tools import executor_create
@@ -62,7 +57,7 @@ INST_ID = "ETH-USDT-SWAP"
 CONTRACT_VALUE_BASE = 0.1  # OKX public instrument metadata: 1 contract = 0.1 ETH
 ENTRY_ORDER_TYPE = 3  # LIMIT_MAKER: retain price control for scalp entries
 TAKE_PROFIT_ORDER_TYPE = 3  # LIMIT_MAKER: collect rather than cross when possible
-RISK_EXIT_ORDER_TYPE = 1  # MARKET: required by PositionExecutor for SL/time-limit safety
+RISK_EXIT_ORDER_TYPE = 3  # LIMIT_MAKER: no strategy path may submit a market exit
 
 
 def executor_submission_status(result: dict[str, Any]) -> tuple[bool, str]:
@@ -85,9 +80,15 @@ def maker_close_price(direction: str, frame: "BookFrame") -> float:
     raise ValueError(f"unsupported position direction: {direction}")
 
 
-def emergency_exit_reason(reason: str) -> bool:
-    """Identify exits where fill certainty must override maker-fee preference."""
-    return reason in {"defensive account hard-stop", "defensive account time limit"}
+def maker_only_executor_barrier_kwargs() -> dict[str, int]:
+    """Keep PositionExecutor responsible only for the passive entry order.
+
+    Hummingbot requires stop-loss and time-limit barriers to use MARKET orders.
+    Supplying either barrier would therefore violate this strategy's strict
+    maker-only contract. Exit triggers are evaluated by this routine and sent
+    as explicit ``LIMIT_MAKER`` close orders instead.
+    """
+    return {"open_order_type": ENTRY_ORDER_TYPE}
 
 
 class Config(BaseModel):
@@ -100,25 +101,30 @@ class Config(BaseModel):
     leverage: int = Field(default=10, ge=10, le=10)
     position_margin_pct: float = Field(default=20, ge=20, le=20)
     max_positions: int = Field(default=1, ge=1, le=1)
-    min_seconds_between_entries: float = Field(default=10, ge=5, le=300)
-    decision_interval_ms: int = Field(default=250, ge=100, le=2000)
-    feature_sample_ms: int = Field(default=1000, ge=250, le=5000)
+    min_seconds_between_entries: float = Field(default=1, ge=0.5, le=300)
+    decision_interval_ms: int = Field(default=100, ge=100, le=2000)
+    feature_sample_ms: int = Field(default=500, ge=250, le=5000)
     book_stale_ms: int = Field(default=750, ge=250, le=5000)
     wall_multiple: float = Field(default=4.0, ge=2, le=20)
     min_wall_age_ms: int = Field(default=750, ge=200, le=10000)
-    min_obi: float = Field(default=0.12, ge=0.02, le=0.8)
-    min_depth_imbalance: float = Field(default=0.08, ge=0.01, le=0.8)
+    min_obi: float = Field(default=0.08, ge=0.02, le=0.8)
+    min_depth_imbalance: float = Field(default=0.05, ge=0.01, le=0.8)
     max_visible_depth_share_pct: float = Field(default=15, ge=1, le=25)
-    min_taker_ratio: float = Field(default=0.56, ge=0.5, le=0.9)
-    min_intent_score: float = Field(default=0.58, ge=0.4, le=0.95)
-    max_spoof_risk: float = Field(default=0.55, ge=0.1, le=0.95)
-    min_iceberg_score: float = Field(default=0.45, ge=0.1, le=0.95)
-    min_stop_pct: float = Field(default=0.12, ge=0.08, le=0.35)
-    max_stop_pct: float = Field(default=0.35, ge=0.12, le=0.50)
+    min_taker_ratio: float = Field(default=0.54, ge=0.5, le=0.9)
+    min_intent_score: float = Field(default=0.55, ge=0.4, le=0.95)
+    max_spoof_risk: float = Field(default=0.65, ge=0.1, le=0.95)
+    max_near_depth_concentration: float = Field(default=0.35, ge=0.05, le=0.80)
+    max_entry_extension_bps: float = Field(default=8, ge=2, le=20)
+    volume_sync_window_seconds: float = Field(default=2, ge=1, le=10)
+    min_volume_acceleration_ratio: float = Field(default=1.05, ge=1, le=3)
+    min_price_sync_bps: float = Field(default=0.25, ge=0.05, le=5)
+    min_iceberg_score: float = Field(default=0.35, ge=0.1, le=0.95)
+    min_stop_pct: float = Field(default=0.05, ge=0.03, le=0.10)
+    early_invalidation_stop_pct: float = Field(default=0.06, ge=0.04, le=0.10)
+    max_stop_pct: float = Field(default=0.10, ge=0.06, le=0.15)
     min_take_profit_pct: float = Field(default=0.18, ge=0.12, le=0.60)
     max_take_profit_pct: float = Field(default=0.60, ge=0.18, le=1.0)
     minimum_reward_risk: float = Field(default=1.20, ge=1.1, le=2.0)
-    time_limit_seconds: int = Field(default=30, ge=15, le=300)
     default_fee_rate_pct: float = Field(default=0.05, gt=0, le=0.2)
     break_even_buffer_pct: float = Field(default=0.01, ge=0.01, le=0.20)
     trailing_delta_stop_ratio: float = Field(default=0.50, ge=0.20, le=1.0)
@@ -127,12 +133,15 @@ class Config(BaseModel):
     retail_stop_lookback_seconds: float = Field(default=30, ge=10, le=120)
     retail_stop_recent_seconds: float = Field(default=3, ge=1, le=10)
     retail_stop_excursion_bps: float = Field(default=0.75, ge=0.25, le=5)
-    entry_timeout_seconds: float = Field(default=5, ge=2, le=30)
-    unfilled_shutdown_grace_seconds: float = Field(default=10, ge=5, le=120)
+    entry_timeout_seconds: float = Field(default=1, ge=0.5, le=30)
+    unfilled_shutdown_grace_seconds: float = Field(default=2, ge=1, le=120)
     minimum_hold_seconds: float = Field(default=0.5, ge=0.5, le=10)
     soft_exit_confirmations: int = Field(default=1, ge=1, le=6)
-    exit_cooldown_seconds: float = Field(default=5, ge=2, le=120)
-    dust_position_notional_usdt: float = Field(default=5, ge=1, le=20)
+    exit_cooldown_seconds: float = Field(default=1, ge=0.5, le=120)
+    flat_confirmation_seconds: float = Field(default=2, ge=1, le=10)
+    min_executable_position_amount_base: float = Field(
+        default=0.001, ge=0.001, le=0.01
+    )
     data_dir: str = Field(default="data/research/eth_dom")
 
     @field_validator("connector_name")
@@ -368,6 +377,77 @@ class DomState:
         }
 
 
+def volume_price_synchronization(
+    trades: Deque[dict[str, float | str]],
+    *,
+    now: float,
+    window_seconds: float,
+    min_volume_ratio: float,
+    min_price_bps: float,
+) -> dict[str, float | str]:
+    """Measure whether price direction is confirmed by expanding taker volume."""
+    if window_seconds <= 0 or min_volume_ratio < 1 or min_price_bps <= 0:
+        raise ValueError("invalid volume-price synchronization inputs")
+    recent_cutoff = now - window_seconds
+    prior_cutoff = recent_cutoff - window_seconds
+    recent: list[dict[str, float | str]] = []
+    prior: list[dict[str, float | str]] = []
+    for trade in reversed(trades):
+        timestamp = float(trade["time"])
+        if timestamp < prior_cutoff:
+            break
+        if timestamp >= recent_cutoff:
+            recent.append(trade)
+        else:
+            prior.append(trade)
+
+    def summarize(rows: list[dict[str, float | str]]) -> tuple[float, float, float]:
+        total = buy = weighted_price = 0.0
+        for trade in rows:
+            price = float(trade["price"])
+            notional = price * float(trade["size"]) * CONTRACT_VALUE_BASE
+            total += notional
+            weighted_price += price * notional
+            if str(trade["side"]) == "buy":
+                buy += notional
+        vwap = weighted_price / total if total > 0 else 0.0
+        signed_delta = (2 * buy - total) / total if total > 0 else 0.0
+        return total, vwap, signed_delta
+
+    recent_volume, recent_vwap, signed_delta = summarize(recent)
+    prior_volume, prior_vwap, _ = summarize(prior)
+    if recent_volume <= 0 or prior_volume <= 0 or recent_vwap <= 0 or prior_vwap <= 0:
+        return {
+            "direction": "FLAT",
+            "price_change_bps": 0.0,
+            "volume_ratio": 0.0,
+            "signed_delta": signed_delta,
+            "recent_notional": recent_volume,
+        }
+    price_change_bps = (recent_vwap / prior_vwap - 1) * 10_000
+    volume_ratio = recent_volume / prior_volume
+    direction = "FLAT"
+    if (
+        price_change_bps >= min_price_bps
+        and volume_ratio >= min_volume_ratio
+        and signed_delta > 0
+    ):
+        direction = "UP"
+    elif (
+        price_change_bps <= -min_price_bps
+        and volume_ratio >= min_volume_ratio
+        and signed_delta < 0
+    ):
+        direction = "DOWN"
+    return {
+        "direction": direction,
+        "price_change_bps": price_change_bps,
+        "volume_ratio": volume_ratio,
+        "signed_delta": signed_delta,
+        "recent_notional": recent_volume,
+    }
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
@@ -508,6 +588,37 @@ def market_depth_metrics(
     return result
 
 
+def liquidity_void_direction(
+    depth: dict[str, float], *, max_near_concentration: float
+) -> str:
+    """Return the executable direction of a near-book liquidity void.
+
+    A low 5 bps/25 bps concentration means that the near side of the book is
+    thin compared with liquidity farther away. Thin asks favour an upward
+    move; thin bids favour a downward move. Ambiguous two-sided voids are not
+    actionable.
+    """
+    if not 0 < max_near_concentration < 1:
+        raise ValueError("invalid liquidity-void concentration threshold")
+    bid_25 = depth.get("bid_depth_25bps", 0.0)
+    ask_25 = depth.get("ask_depth_25bps", 0.0)
+    if bid_25 <= 0 or ask_25 <= 0:
+        return "NONE"
+    bid_thin = depth.get("bid_depth_concentration", 1.0) <= max_near_concentration
+    ask_thin = depth.get("ask_depth_concentration", 1.0) <= max_near_concentration
+    bid_concentration = depth.get("bid_depth_concentration", 1.0)
+    ask_concentration = depth.get("ask_depth_concentration", 1.0)
+    if ask_thin and (
+        not bid_thin or ask_concentration <= bid_concentration * 0.85
+    ):
+        return "UP"
+    if bid_thin and (
+        not ask_thin or bid_concentration <= ask_concentration * 0.85
+    ):
+        return "DOWN"
+    return "NONE"
+
+
 def depth_limited_margin(
     *,
     direction: str,
@@ -608,6 +719,98 @@ def detect_retail_stop_run(
     }
 
 
+def entry_location_is_valid(
+    direction: str,
+    *,
+    mid: float,
+    vwap: float,
+    poc: float,
+    val: float,
+    vah: float,
+    max_extension_bps: float,
+) -> bool:
+    """Reject entries that chase too far beyond VWAP/volume-profile value.
+
+    A long must remain above its VWAP/POC support without being extended far
+    from it; a short uses the symmetric resistance rule. VAL/VAH add an outer
+    value-area guard when enough prints exist to calculate them.
+    """
+    if (
+        direction not in {"LONG", "SHORT"}
+        or mid <= 0
+        or vwap <= 0
+        or poc <= 0
+        or max_extension_bps <= 0
+    ):
+        return False
+    value_area_slack = 2 / 10_000
+    if direction == "LONG":
+        anchor = max(vwap, poc)
+        return (
+            mid >= anchor
+            and (mid / anchor - 1) * 10_000 <= max_extension_bps
+            and (vah <= 0 or mid <= vah * (1 + value_area_slack))
+        )
+    anchor = min(vwap, poc)
+    return (
+        mid <= anchor
+        and (anchor / mid - 1) * 10_000 <= max_extension_bps
+        and (val <= 0 or mid >= val * (1 - value_area_slack))
+    )
+
+
+def maker_entry_price(
+    direction: str,
+    *,
+    frame: BookFrame,
+    vwap: float,
+    poc: float,
+    val: float,
+    vah: float,
+    intent: dict[str, Any],
+    rules: dict[str, Any],
+    max_offset_bps: float,
+) -> float:
+    """Choose the nearest passive VWAP/VP/wall level for a maker entry."""
+    if direction not in {"LONG", "SHORT"} or max_offset_bps <= 0:
+        raise ValueError("invalid maker entry inputs")
+    tick = _number(rules.get("min_price_increment"))
+    if direction == "LONG":
+        lower_bound = frame.best_bid * (1 - max_offset_bps / 10_000)
+        supports = [
+            level
+            for level in (vwap, poc, val, _number(intent.get("bid_wall_price")))
+            if lower_bound <= level <= frame.best_bid
+        ]
+        candidate = max(supports) if supports else frame.best_bid
+        if tick > 0:
+            quantum = Decimal(str(tick))
+            candidate = float(
+                (Decimal(str(candidate)) / quantum).to_integral_value(
+                    rounding=ROUND_DOWN
+                )
+                * quantum
+            )
+        return min(candidate, frame.best_bid)
+
+    upper_bound = frame.best_ask * (1 + max_offset_bps / 10_000)
+    resistances = [
+        level
+        for level in (vwap, poc, vah, _number(intent.get("ask_wall_price")))
+        if frame.best_ask <= level <= upper_bound
+    ]
+    candidate = min(resistances) if resistances else frame.best_ask
+    if tick > 0:
+        quantum = Decimal(str(tick))
+        candidate = float(
+            (Decimal(str(candidate)) / quantum).to_integral_value(
+                rounding=ROUND_UP
+            )
+            * quantum
+        )
+    return max(candidate, frame.best_ask)
+
+
 def dom_signal(
     *,
     frame: BookFrame,
@@ -617,16 +820,44 @@ def dom_signal(
     sweep: dict[str, bool],
     vwap: float,
     poc: float,
+    val: float,
+    vah: float,
+    trend: str,
+    volume_price: dict[str, float | str],
     config: Config,
 ) -> dict[str, Any]:
     micro_bps = (frame.microprice / frame.mid - 1) * 10_000
+    liquidity_void = liquidity_void_direction(
+        depth, max_near_concentration=config.max_near_depth_concentration
+    )
+    long_location = entry_location_is_valid(
+        "LONG",
+        mid=frame.mid,
+        vwap=vwap,
+        poc=poc,
+        val=val,
+        vah=vah,
+        max_extension_bps=config.max_entry_extension_bps,
+    )
+    short_location = entry_location_is_valid(
+        "SHORT",
+        mid=frame.mid,
+        vwap=vwap,
+        poc=poc,
+        val=val,
+        vah=vah,
+        max_extension_bps=config.max_entry_extension_bps,
+    )
     long_checks = {
         "book": frame.obi >= config.min_obi and micro_bps > 0,
         "trades": flow["buy_ratio"] >= config.min_taker_ratio,
-        "value": frame.mid > vwap > 0 and frame.mid > poc > 0,
+        "value": long_location,
         "intent": intent.get("bid_intent", 0) >= config.min_intent_score,
         "depth": depth.get("depth_imbalance_10bps", 0)
         >= config.min_depth_imbalance,
+        "liquidity_void": liquidity_void == "UP",
+        "trend": trend == "UP",
+        "volume_price_sync": volume_price.get("direction") == "UP",
         "iceberg_or_sweep": intent.get("bid_iceberg", 0)
         >= config.min_iceberg_score
         or sweep["long_reclaim"],
@@ -635,10 +866,13 @@ def dom_signal(
     short_checks = {
         "book": frame.obi <= -config.min_obi and micro_bps < 0,
         "trades": flow["sell_ratio"] >= config.min_taker_ratio,
-        "value": 0 < frame.mid < vwap and 0 < frame.mid < poc,
+        "value": short_location,
         "intent": intent.get("ask_intent", 0) >= config.min_intent_score,
         "depth": depth.get("depth_imbalance_10bps", 0)
         <= -config.min_depth_imbalance,
+        "liquidity_void": liquidity_void == "DOWN",
+        "trend": trend == "DOWN",
+        "volume_price_sync": volume_price.get("direction") == "DOWN",
         "iceberg_or_sweep": intent.get("ask_iceberg", 0)
         >= config.min_iceberg_score
         or sweep["short_reclaim"],
@@ -648,9 +882,21 @@ def dom_signal(
     short_score = sum(short_checks.values())
     direction = "FLAT"
     checks: dict[str, bool] = {}
-    if long_score >= 6 and long_score > short_score:
+    if (
+        long_checks["liquidity_void"]
+        and long_checks["trend"]
+        and long_checks["volume_price_sync"]
+        and long_score >= 8
+        and long_score > short_score
+    ):
         direction, checks = "LONG", long_checks
-    elif short_score >= 6 and short_score > long_score:
+    elif (
+        short_checks["liquidity_void"]
+        and short_checks["trend"]
+        and short_checks["volume_price_sync"]
+        and short_score >= 8
+        and short_score > long_score
+    ):
         direction, checks = "SHORT", short_checks
     return {
         "direction": direction,
@@ -680,13 +926,13 @@ def dynamic_barriers(
         supports = [x for x in (val, poc, vwap, intent.get("bid_wall_price", 0)) if 0 < x < price]
         targets = [x for x in (vah, intent.get("ask_wall_price", 0)) if x > price]
         support = max(supports) if supports else price * (1 - config.min_stop_pct / 100)
-        raw_stop = (price - support) / price * 100 + 0.04
+        raw_stop = (price - support) / price * 100 + 0.02
         raw_target = (min(targets) - price) / price * 100 if targets else 0.0
     else:
         resistances = [x for x in (vah, poc, vwap, intent.get("ask_wall_price", 0)) if x > price]
         targets = [x for x in (val, intent.get("bid_wall_price", 0)) if 0 < x < price]
         resistance = min(resistances) if resistances else price * (1 + config.min_stop_pct / 100)
-        raw_stop = (resistance - price) / price * 100 + 0.04
+        raw_stop = (resistance - price) / price * 100 + 0.02
         raw_target = (price - max(targets)) / price * 100 if targets else 0.0
     stop_pct = _clamp(raw_stop, config.min_stop_pct, config.max_stop_pct)
     target_pct = max(raw_target, stop_pct * config.minimum_reward_risk)
@@ -814,6 +1060,42 @@ def executor_entry_price(row: dict[str, Any]) -> float:
     )
 
 
+def executor_filled_base_amount(row: dict[str, Any]) -> float:
+    """Return actual entry fills, falling back to configured size."""
+    custom = row.get("custom_info") if isinstance(row.get("custom_info"), dict) else {}
+    held = custom.get("held_position_orders") if isinstance(custom.get("held_position_orders"), list) else []
+    executed = sum(
+        _number(order.get("executed_amount_base"))
+        for order in held
+        if isinstance(order, dict)
+        and str(order.get("position") or "OPEN").upper() == "OPEN"
+    )
+    if executed > 0:
+        return executed
+    config = row.get("config") if isinstance(row.get("config"), dict) else {}
+    return max(0.0, _number(config.get("amount") or row.get("amount")))
+
+
+def matched_executor_close_amount(
+    position: dict[str, Any], rows: list[dict[str, Any]]
+) -> float:
+    """Cap a close by the fill record matching side and entry price."""
+    direction = account_position_direction(position)
+    entry = _number(position.get("entry_price"))
+    if direction is None or entry <= 0:
+        return 0.0
+    for row in rows:
+        row_entry = executor_entry_price(row)
+        if executor_direction(row) != direction or row_entry <= 0:
+            continue
+        if abs(row_entry / entry - 1) > 0.0002:
+            continue
+        amount = executor_filled_base_amount(row)
+        if amount > 0:
+            return min(abs(_number(position.get("amount"))), amount)
+    return 0.0
+
+
 def executor_has_fill(row: dict[str, Any]) -> bool:
     """Whether a running executor owns a filled position, not only an order."""
     return bool(row.get("is_trading")) or _number(row.get("filled_amount_quote")) > 0
@@ -893,15 +1175,69 @@ def protected_exit_reason(
         candidate_reason and candidate_reason.startswith("retail ")
     )
     if (
-        not candidate_reason
-        or (held_seconds < minimum_hold_seconds and not profit_target_reached)
+        candidate_reason
+        and (held_seconds >= minimum_hold_seconds or profit_target_reached)
+        and candidate_confirmations >= required_confirmations
+        and current_gross_pct >= fee_covered_floor
     ):
-        return None
-    if candidate_confirmations < required_confirmations:
-        return None
-    if current_gross_pct < fee_covered_floor:
-        return None
-    return candidate_reason
+        return candidate_reason
+    # A scalp is complete as soon as the executable quote covers both legs of
+    # observed fees plus the configured buffer. Requiring another DOM anomaly
+    # here let brief winners turn into time-limit losers.
+    if (
+        held_seconds >= minimum_hold_seconds
+        and current_gross_pct >= fee_covered_floor
+    ):
+        return "fee-covered scalp target"
+    return None
+
+
+def losing_trade_exit_reason(
+    *,
+    candidate_reason: str | None,
+    current_gross_pct: float,
+    early_invalidation_stop_pct: float,
+    max_stop_pct: float,
+) -> str | None:
+    """Cut a structurally invalid loser before the absolute price stop.
+
+    The early exit is deliberately limited to confirmed defensive DOM
+    conditions. Ordinary noise may not crystallise a loss, while the hard stop
+    remains unconditional.
+    """
+    if not 0 < early_invalidation_stop_pct <= max_stop_pct:
+        raise ValueError("invalid loss-stop thresholds")
+    if current_gross_pct <= -max_stop_pct:
+        return "defensive account hard-stop"
+    if (
+        candidate_reason
+        and candidate_reason.startswith("defensive ")
+        and current_gross_pct <= -early_invalidation_stop_pct
+    ):
+        return "early liquidity invalidation stop"
+    return None
+
+
+def partial_maker_exit_should_retry(
+    *,
+    submitted_amount: float,
+    remaining_amount: float,
+    has_active_order: bool,
+) -> bool:
+    """Retry only a confirmed maker-close remainder.
+
+    The venue position must have decreased since the last close submission.
+    This guards against duplicating a close while the position endpoint is
+    merely stale, while still ensuring a partial fill cannot strand exposure.
+    """
+    if submitted_amount < 0 or remaining_amount < 0:
+        raise ValueError("maker-exit amounts cannot be negative")
+    return (
+        not has_active_order
+        and remaining_amount > 0
+        and submitted_amount > 0
+        and remaining_amount < submitted_amount - 1e-9
+    )
 
 
 def one_shot_position_margin(
@@ -924,11 +1260,11 @@ def one_shot_position_margin(
 def pair_position_rows(
     payload: Any,
     trading_pair: str = PAIR,
-    min_notional_usdt: float = 0,
+    min_amount_base: float = 0,
 ) -> list[dict[str, Any]]:
-    """Extract executable account positions while ignoring venue dust."""
-    if min_notional_usdt < 0:
-        raise ValueError("minimum position notional cannot be negative")
+    """Extract positions large enough for another exchange close order."""
+    if min_amount_base < 0:
+        raise ValueError("minimum position amount cannot be negative")
     rows = payload.get("data", []) if isinstance(payload, dict) else []
     return [
         row
@@ -936,10 +1272,21 @@ def pair_position_rows(
         if isinstance(row, dict)
         and str(row.get("trading_pair") or "").upper() == trading_pair
         and abs(_number(row.get("amount"))) > 0
-        and abs(_number(row.get("amount")))
-        * _number(row.get("entry_price"))
-        >= min_notional_usdt
+        # Tolerate tiny normalization jitter around the venue's exact step.
+        and abs(_number(row.get("amount"))) >= min_amount_base * 0.999
     ]
+
+
+def quantize_close_amount(
+    *, base_amount: float, price: float, rules: dict[str, Any]
+) -> float:
+    """Round a venue position down to an executable reduce-only amount."""
+    minimum = _number(rules.get("min_order_size"))
+    if minimum > 0 and minimum * 0.999 <= base_amount < minimum:
+        # Position normalization can report an exact minimum lot a few
+        # millionths below the rule. A reduce-only close is safe at one lot.
+        return minimum
+    return quantize_amount(base_amount * price, price, rules)
 
 
 def pair_active_order_rows(
@@ -963,6 +1310,26 @@ def pair_active_order_rows(
     ]
 
 
+def orphan_order_ids_to_cancel(
+    *,
+    account_positions: list[dict[str, Any]],
+    blocking_executors: list[dict[str, Any]],
+    active_orders: list[dict[str, Any]],
+    already_requested: set[str],
+) -> list[str]:
+    """Return stale order ids that could reverse an already-flat account."""
+    if account_positions or blocking_executors:
+        return []
+    candidates: list[str] = []
+    for order in active_orders:
+        client_order_id = str(
+            order.get("client_order_id") or order.get("order_id") or ""
+        )
+        if client_order_id and client_order_id not in already_requested:
+            candidates.append(client_order_id)
+    return candidates
+
+
 def account_position_direction(row: dict[str, Any]) -> str | None:
     """Normalize a venue position direction without trusting one field alone."""
     side = str(row.get("side") or "").upper()
@@ -972,6 +1339,17 @@ def account_position_direction(row: dict[str, Any]) -> str | None:
     if side in {"SHORT", "SELL"} or amount < 0:
         return "SHORT"
     return None
+
+
+def account_position_tracker_key(row: dict[str, Any]) -> str:
+    """Identify a venue position without its unstable normalized amount.
+
+    The OKX demo position endpoint can slightly vary ``amount`` between polls.
+    Including it in the identity reset the holding timer every second and kept
+    orphan positions from ever reaching their timed maker exit.
+    """
+    direction = account_position_direction(row) or "UNKNOWN"
+    return f"{direction}:{_number(row.get('entry_price')):.12g}"
 
 
 def pending_entry_should_expire(
@@ -1093,28 +1471,89 @@ async def _dom_stream(state: DomState) -> None:
             delay = min(30.0, delay * 2)
 
 
-async def _market_structure(session: aiohttp.ClientSession) -> dict[str, float]:
-    candles, trades = await asyncio.gather(
-        _okx_candles(session, INST_ID),
-        _okx_public_json(session, "/api/v5/market/trades", {"instId": INST_ID, "limit": "500"}),
+def orderflow_structure(
+    trades: Deque[dict[str, float | str]] | list[dict[str, float | str]],
+    *,
+    mid: float,
+    now: float | None = None,
+    lookback_seconds: float = 60,
+    recent_seconds: float = 15,
+) -> dict[str, Any]:
+    """Build VWAP, VP and tape direction from prints, without candles."""
+    observed_at = now if now is not None else time.time()
+    window = [
+        row
+        for row in trades
+        if observed_at - lookback_seconds <= _number(row.get("time")) <= observed_at
+        and _number(row.get("price")) > 0
+        and _number(row.get("size")) > 0
+    ]
+    empty = {
+        "vwap": 0.0,
+        "poc": 0.0,
+        "val": 0.0,
+        "vah": 0.0,
+        "trend": "FLAT",
+        "trend_slope_bps": 0.0,
+    }
+    if len(window) < 30 or mid <= 0 or not 0 < recent_seconds < lookback_seconds:
+        return empty
+
+    def print_vwap(rows: list[dict[str, float | str]]) -> float:
+        volume = sum(_number(row.get("size")) for row in rows)
+        return (
+            sum(_number(row.get("price")) * _number(row.get("size")) for row in rows)
+            / volume
+            if volume > 0
+            else 0.0
+        )
+
+    recent_cutoff = observed_at - recent_seconds
+    prior_cutoff = recent_cutoff - recent_seconds
+    recent = [row for row in window if _number(row.get("time")) >= recent_cutoff]
+    prior = [
+        row
+        for row in window
+        if prior_cutoff <= _number(row.get("time")) < recent_cutoff
+    ]
+    vwap = print_vwap(window)
+    recent_vwap = print_vwap(recent)
+    prior_vwap = print_vwap(prior)
+    slope_bps = (
+        (recent_vwap / prior_vwap - 1) * 10_000
+        if recent_vwap > 0 and prior_vwap > 0
+        else 0.0
     )
-    normalized = _normalize_candles(candles)
-    if len(normalized) < 30:
-        raise RuntimeError("insufficient ETH candles")
-    vwap, _ = candle_vwap(normalized, 30)
-    poc, val, vah = trade_volume_profile_levels(trades, 30)
-    return {"vwap": vwap, "poc": poc, "val": val, "vah": vah}
-
-
-async def _okx_public_json(
-    session: aiohttp.ClientSession, path: str, params: dict[str, str]
-) -> list[dict[str, Any]]:
-    async with session.get(f"https://www.okx.com{path}", params=params) as response:
-        response.raise_for_status()
-        payload = await response.json()
-    if str(payload.get("code")) != "0":
-        raise RuntimeError(str(payload.get("msg") or "OKX rejected market request"))
-    return [row for row in payload.get("data", []) if isinstance(row, dict)]
+    recent_buy = sum(
+        _number(row.get("price")) * _number(row.get("size"))
+        for row in recent
+        if str(row.get("side") or "").lower() == "buy"
+    )
+    recent_sell = sum(
+        _number(row.get("price")) * _number(row.get("size"))
+        for row in recent
+        if str(row.get("side") or "").lower() == "sell"
+    )
+    recent_total = recent_buy + recent_sell
+    buy_ratio = recent_buy / recent_total if recent_total > 0 else 0.5
+    direction = "FLAT"
+    if mid > vwap > 0 and slope_bps > 0 and buy_ratio >= 0.52:
+        direction = "UP"
+    elif 0 < mid < vwap and slope_bps < 0 and buy_ratio <= 0.48:
+        direction = "DOWN"
+    profile_rows = [
+        {"px": row.get("price"), "sz": row.get("size")}
+        for row in window
+    ]
+    poc, val, vah = trade_volume_profile_levels(profile_rows, 30)
+    return {
+        "vwap": vwap,
+        "poc": poc,
+        "val": val,
+        "vah": vah,
+        "trend": direction,
+        "trend_slope_bps": slope_bps,
+    }
 
 
 def should_exit(
@@ -1133,6 +1572,8 @@ def should_exit(
     bid_depth = depth.get("bid_depth_10bps", 0.0)
     ask_depth = depth.get("ask_depth_10bps", 0.0)
     depth_imbalance = depth.get("depth_imbalance_5bps", 0.0)
+    bid_concentration = depth.get("bid_depth_concentration", 1.0)
+    ask_concentration = depth.get("ask_depth_concentration", 1.0)
     if direction == "LONG":
         if retail_stop_run.get("upper_stop_run"):
             return "retail short-stop pool reached"
@@ -1145,6 +1586,8 @@ def should_exit(
             return "defensive bid-liquidity collapse"
         if depth_imbalance <= -0.18 and intent.get("ask_intent", 0) >= 0.58:
             return "defensive near-book ask dominance"
+        if bid_concentration <= 0.12 and flow["sell_ratio"] >= 0.52:
+            return "defensive downside liquidity void"
         if frame.mid < min(vwap, poc) and frame.obi < -0.08:
             return "defensive VWAP/POC loss with adverse book"
         if flow["sell_ratio"] >= 0.60 and intent.get("ask_intent", 0) >= 0.60:
@@ -1161,6 +1604,8 @@ def should_exit(
             return "defensive ask-liquidity collapse"
         if depth_imbalance >= 0.18 and intent.get("bid_intent", 0) >= 0.58:
             return "defensive near-book bid dominance"
+        if ask_concentration <= 0.12 and flow["buy_ratio"] >= 0.52:
+            return "defensive upside liquidity void"
         if frame.mid > max(vwap, poc) and frame.obi > 0.08:
             return "defensive VWAP/POC reclaim with adverse book"
         if flow["buy_ratio"] >= 0.60 and intent.get("bid_intent", 0) >= 0.60:
@@ -1189,7 +1634,14 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
         tags=["okx", "demo", "eth", "dom", "iceberg", "research"],
     )
     last_structure_at = 0.0
-    structure = {"vwap": 0.0, "poc": 0.0, "val": 0.0, "vah": 0.0}
+    structure: dict[str, Any] = {
+        "vwap": 0.0,
+        "poc": 0.0,
+        "val": 0.0,
+        "vah": 0.0,
+        "trend": "FLAT",
+        "trend_slope_bps": 0.0,
+    }
     last_sample_at = 0.0
     last_venue_state_at = 0.0
     account_positions: list[dict[str, Any]] = []
@@ -1199,7 +1651,9 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     exit_trackers: dict[str, dict[str, Any]] = {}
     account_exit_tracker: dict[str, Any] = {}
     account_exit_pending_until = 0.0
+    flat_confirmed_since = 0.0
     manual_limit_exits: dict[str, dict[str, Any]] = {}
+    orphan_order_cancel_requests: set[str] = set()
     shutdown_seen_at: dict[str, float] = {}
     last_signal = "FLAT"
     last_trailing = {
@@ -1214,24 +1668,35 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             while True:
                 await _ensure_initialized_client(client)
                 now = time.time()
-                if now - last_structure_at >= 10:
-                    structure = await retry_network_call(
-                        lambda: _market_structure(session), max_delay=30
-                    )
-                    last_structure_at = now
                 frame = state.book_frame(now)
                 if frame is None or (now - state.last_book_time) * 1000 > config.book_stale_ms:
                     last_signal = "STALE"
                     await asyncio.sleep(config.decision_interval_ms / 1000)
                     continue
+                if now - last_structure_at >= 1:
+                    structure = orderflow_structure(
+                        state.trades, mid=frame.mid, now=now
+                    )
+                    last_structure_at = now
 
                 flow = state.recent_trade_flow(2.0)
+                volume_price = volume_price_synchronization(
+                    state.trades,
+                    now=now,
+                    window_seconds=config.volume_sync_window_seconds,
+                    min_volume_ratio=config.min_volume_acceleration_ratio,
+                    min_price_bps=config.min_price_sync_bps,
+                )
                 intent = infer_dom_intent(
                     state,
                     wall_multiple=config.wall_multiple,
                     min_wall_age_ms=config.min_wall_age_ms,
                 )
                 depth = market_depth_metrics(state)
+                current_liquidity_void = liquidity_void_direction(
+                    depth,
+                    max_near_concentration=config.max_near_depth_concentration,
+                )
                 sweep = detect_liquidity_sweep(
                     state, val=structure["val"], vah=structure["vah"]
                 )
@@ -1250,6 +1715,10 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     sweep=sweep,
                     vwap=structure["vwap"],
                     poc=structure["poc"],
+                    val=structure["val"],
+                    vah=structure["vah"],
+                    trend=str(structure["trend"]),
+                    volume_price=volume_price,
                     config=config,
                 )
                 last_signal = signal["direction"]
@@ -1265,6 +1734,12 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             "microprice_bps": signal["microprice_bps"],
                             "buy_ratio": flow["buy_ratio"],
                             "sell_ratio": flow["sell_ratio"],
+                            "volume_price_sync": volume_price["direction"],
+                            "volume_ratio": volume_price["volume_ratio"],
+                            "volume_price_change_bps": volume_price[
+                                "price_change_bps"
+                            ],
+                            "signed_volume_delta": volume_price["signed_delta"],
                             "bid_depth_5bps": depth.get("bid_depth_5bps", 0),
                             "ask_depth_5bps": depth.get("ask_depth_5bps", 0),
                             "bid_depth_10bps": depth.get("bid_depth_10bps", 0),
@@ -1278,6 +1753,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             "ask_depth_concentration": depth.get("ask_depth_concentration", 0),
                             "vwap_distance_bps": (frame.mid / structure["vwap"] - 1) * 10_000 if structure["vwap"] else 0,
                             "poc_distance_bps": (frame.mid / structure["poc"] - 1) * 10_000 if structure["poc"] else 0,
+                            "vwap": structure["vwap"],
+                            "vp_poc": structure["poc"],
+                            "vp_val": structure["val"],
+                            "vp_vah": structure["vah"],
+                            "liquidity_void": current_liquidity_void,
+                            "trend": structure["trend"],
+                            "trend_slope_bps": structure["trend_slope_bps"],
                             "long_sweep_reclaim": sweep["long_reclaim"],
                             "short_sweep_reclaim": sweep["short_reclaim"],
                             "upper_retail_stop_run": retail_stop_run["upper_stop_run"],
@@ -1325,7 +1807,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     )
                     account_positions = pair_position_rows(
                         positions_payload,
-                        min_notional_usdt=config.dust_position_notional_usdt,
+                        min_amount_base=config.min_executable_position_amount_base,
                     )
                     account_active_orders = pair_active_order_rows(orders_payload)
                     last_venue_state_at = now
@@ -1355,6 +1837,40 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     if executor_id not in closing_ids:
                         shutdown_seen_at.pop(executor_id, None)
                 blocking = [*active, *effective_closing]
+                active_order_ids = {
+                    str(order.get("client_order_id") or order.get("order_id") or "")
+                    for order in account_active_orders
+                }
+                orphan_order_cancel_requests.intersection_update(active_order_ids)
+                # A passive close may fill while its remaining quantity is
+                # still resting. Once the account is flat and no executor owns
+                # the order, leaving that remainder live can reverse the
+                # position. Cancel it and retain the venue-order entry lock
+                # until the exchange confirms that it disappeared.
+                orphan_order_ids = orphan_order_ids_to_cancel(
+                    account_positions=account_positions,
+                    blocking_executors=blocking,
+                    active_orders=account_active_orders,
+                    already_requested=orphan_order_cancel_requests,
+                )
+                for client_order_id in orphan_order_ids:
+                    await retry_network_call(
+                        lambda client_order_id=client_order_id: client.trading.cancel_order(
+                            config.account_name,
+                            config.connector_name,
+                            client_order_id,
+                        )
+                    )
+                    orphan_order_cancel_requests.add(client_order_id)
+                    events.append(
+                        {
+                            "Time": time.strftime("%H:%M:%S"),
+                            "Action": "CANCEL ORPHAN ORDER",
+                            "Side": "FLAT",
+                            "Margin": "—",
+                            "Reason": "account flat; prevent stale close from reversing",
+                        }
+                    )
                 fee_rates = observed_fee_rates(rows)
                 estimated_round_trip = 2 * fee_rates.get(
                     PAIR, config.default_fee_rate_pct
@@ -1389,7 +1905,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             account_has_position=bool(account_positions),
                         ):
                             await client.executors.stop_executor(
-                                executor_id=executor_id, keep_position=False
+                                executor_id=executor_id, keep_position=True
                             )
                             exit_cooldown_until = (
                                 now + config.exit_cooldown_seconds
@@ -1401,7 +1917,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                     "Action": "CANCEL",
                                     "Side": direction,
                                     "Margin": "—",
-                                    "Reason": "unfilled market entry expired",
+                                    "Reason": "unfilled maker entry expired; reprice",
                                 }
                             )
                             exit_trackers.pop(executor_id, None)
@@ -1458,6 +1974,17 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         held_seconds=now - _number(tracker.get("filled_since")),
                         minimum_hold_seconds=config.minimum_hold_seconds,
                     )
+                    held_seconds = now - _number(tracker.get("filled_since"))
+                    loss_reason = losing_trade_exit_reason(
+                        candidate_reason=candidate,
+                        current_gross_pct=current_gross_pct,
+                        early_invalidation_stop_pct=(
+                            config.early_invalidation_stop_pct
+                        ),
+                        max_stop_pct=config.max_stop_pct,
+                    )
+                    if loss_reason:
+                        reason = loss_reason
                     if reason:
                         # Detach the position without letting the executor use
                         # its default market close. Once its existing child
@@ -1472,6 +1999,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 "reason": reason,
                                 "requested_at": now,
                                 "submitted": False,
+                                "matched_amount": executor_filled_base_amount(row),
                             }
                         exit_cooldown_until = now + config.exit_cooldown_seconds
                         exited_this_tick = True
@@ -1501,6 +2029,22 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     position = account_positions[0] if len(account_positions) == 1 else None
                     direction = account_position_direction(position or {})
                     for executor_id, request in list(manual_limit_exits.items()):
+                        remaining_amount = abs(_number((position or {}).get("amount")))
+                        if request.get("submitted") and partial_maker_exit_should_retry(
+                            submitted_amount=_number(request.get("submitted_amount")),
+                            remaining_amount=remaining_amount,
+                            has_active_order=bool(account_active_orders),
+                        ):
+                            request["submitted"] = False
+                            events.append(
+                                {
+                                    "Time": time.strftime("%H:%M:%S"),
+                                    "Action": "EXIT LIMIT RETRY",
+                                    "Side": direction or "UNKNOWN",
+                                    "Margin": "—",
+                                    "Reason": f"maker partial-fill remainder {remaining_amount:.9f}",
+                                }
+                            )
                         if (
                             position
                             and direction == request.get("direction")
@@ -1508,6 +2052,22 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             and not account_active_orders
                         ):
                             limit_price = maker_close_price(direction, frame)
+                            matched_amount = _number(request.get("matched_amount"))
+                            requested_close_amount = (
+                                min(remaining_amount, matched_amount)
+                                if matched_amount > 0
+                                else remaining_amount * 0.995
+                            )
+                            rules_payload = await retry_network_call(
+                                lambda: client.connectors.get_trading_rules(
+                                    config.connector_name, [PAIR]
+                                )
+                            )
+                            close_amount = quantize_close_amount(
+                                base_amount=requested_close_amount,
+                                price=limit_price,
+                                rules=rules_payload.get(PAIR, {}),
+                            )
                             await retry_network_call(
                                 lambda: client.trading.place_order(
                                     account_name=config.account_name,
@@ -1516,7 +2076,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                     trade_type=(
                                         "SELL" if direction == "LONG" else "BUY"
                                     ),
-                                    amount=abs(_number(position.get("amount"))),
+                                    amount=close_amount,
                                     order_type="LIMIT_MAKER",
                                     price=limit_price,
                                     position_action="CLOSE",
@@ -1524,6 +2084,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             )
                             request["submitted"] = True
                             request["submitted_at"] = now
+                            request["submitted_amount"] = close_amount
                             account_active_orders = [
                                 {
                                     "trading_pair": PAIR,
@@ -1567,10 +2128,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     direction = account_position_direction(position)
                     entry_price = _number(position.get("entry_price"))
                     if direction and entry_price > 0:
-                        tracker_key = (
-                            f"{direction}:{entry_price:.12g}:"
-                            f"{abs(_number(position.get('amount'))):.12g}"
-                        )
+                        tracker_key = account_position_tracker_key(position)
                         if account_exit_tracker.get("key") != tracker_key:
                             account_exit_tracker = {
                                 "key": tracker_key,
@@ -1635,17 +2193,35 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             held_seconds=held_seconds,
                             minimum_hold_seconds=config.minimum_hold_seconds,
                         )
-                        if current_gross_pct <= -config.max_stop_pct:
-                            reason = "defensive account hard-stop"
-                        elif held_seconds >= config.time_limit_seconds:
-                            reason = "defensive account time limit"
+                        loss_reason = losing_trade_exit_reason(
+                            candidate_reason=candidate,
+                            current_gross_pct=current_gross_pct,
+                            early_invalidation_stop_pct=(
+                                config.early_invalidation_stop_pct
+                            ),
+                            max_stop_pct=config.max_stop_pct,
+                        )
+                        if loss_reason:
+                            reason = loss_reason
                         if reason and now >= account_exit_pending_until:
-                            is_emergency = emergency_exit_reason(reason)
-                            close_order_type = "MARKET" if is_emergency else "LIMIT_MAKER"
-                            close_price = (
-                                None
-                                if is_emergency
-                                else maker_close_price(direction, frame)
+                            close_order_type = "LIMIT_MAKER"
+                            close_price = maker_close_price(direction, frame)
+                            matched_amount = matched_executor_close_amount(position, rows)
+                            reported_amount = abs(_number(position.get("amount")))
+                            requested_close_amount = (
+                                matched_amount
+                                if matched_amount > 0
+                                else reported_amount * 0.995
+                            )
+                            rules_payload = await retry_network_call(
+                                lambda: client.connectors.get_trading_rules(
+                                    config.connector_name, [PAIR]
+                                )
+                            )
+                            close_amount = quantize_close_amount(
+                                base_amount=requested_close_amount,
+                                price=close_price,
+                                rules=rules_payload.get(PAIR, {}),
                             )
                             await retry_network_call(
                                 lambda: client.trading.place_order(
@@ -1655,7 +2231,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                     trade_type=(
                                         "SELL" if direction == "LONG" else "BUY"
                                     ),
-                                    amount=abs(_number(position.get("amount"))),
+                                    amount=close_amount,
                                     order_type=close_order_type,
                                     price=close_price,
                                     position_action="CLOSE",
@@ -1698,6 +2274,14 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         blocking or account_positions or account_active_orders
                     ),
                 )
+                if blocking or account_positions or account_active_orders or manual_limit_exits:
+                    flat_confirmed_since = 0.0
+                elif flat_confirmed_since <= 0:
+                    flat_confirmed_since = now
+                flat_confirmed = (
+                    flat_confirmed_since > 0
+                    and now - flat_confirmed_since >= config.flat_confirmation_seconds
+                )
                 can_enter = (
                     signal["direction"] in {"LONG", "SHORT"}
                     and not exited_this_tick
@@ -1709,6 +2293,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                     and not blocking
                     and position_margin > 0
                     and now - last_entry_at >= config.min_seconds_between_entries
+                    and flat_confirmed
                 )
                 if can_enter:
                     direction = signal["direction"]
@@ -1780,7 +2365,17 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             maximums["max_buy" if direction == "LONG" else "max_sell"],
                             rules,
                         )
-                        entry_price = frame.best_bid if direction == "LONG" else frame.best_ask
+                        entry_price = maker_entry_price(
+                            direction,
+                            frame=frame,
+                            vwap=structure["vwap"],
+                            poc=structure["poc"],
+                            val=structure["val"],
+                            vah=structure["vah"],
+                            intent=intent,
+                            rules=rules,
+                            max_offset_bps=config.max_entry_extension_bps,
+                        )
                         result = await retry_network_call(
                             lambda: executor_create.create_position_executor(
                                 client,
@@ -1790,15 +2385,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 amount=amount,
                                 entry_price=entry_price,
                                 leverage=config.leverage,
-                                stop_loss=barriers["stop_loss_pct"] / 100,
-                                take_profit=barriers["take_profit_pct"] / 100,
-                                time_limit=config.time_limit_seconds,
-                                trailing_stop_activation_price=trailing["activation_pct"] / 100,
-                                trailing_stop_trailing_delta=trailing["trailing_delta_pct"] / 100,
-                                open_order_type=ENTRY_ORDER_TYPE,
-                                take_profit_order_type=TAKE_PROFIT_ORDER_TYPE,
-                                stop_loss_order_type=RISK_EXIT_ORDER_TYPE,
-                                time_limit_order_type=RISK_EXIT_ORDER_TYPE,
+                                **maker_only_executor_barrier_kwargs(),
                                 level_id="eth-dom-research",
                                 account_name=config.account_name,
                                 controller_id=config.controller_id,
@@ -1814,7 +2401,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                                 "Action": "ENTRY" if submitted else "ENTRY REJECTED",
                                 "Side": direction,
                                 "Margin": f"{position_margin:.2f} / {equity * 0.20:.2f}",
-                                "Reason": f"DOM {signal['score']}/7; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {submission_detail}",
+                                "Reason": f"DOM {signal['score']}/10; maker {entry_price:.2f}; tape {structure['trend']} {structure['trend_slope_bps']:+.2f}bps; volume-price {volume_price['direction']} {volume_price['price_change_bps']:+.2f}bps x{volume_price['volume_ratio']:.2f}; depth {depth.get('depth_imbalance_10bps', 0):+.2f}; SL {barriers['stop_loss_pct']:.2f}%; TP {barriers['take_profit_pct']:.2f}%; trail {trailing['activation_pct']:.2f}/{trailing['trailing_delta_pct']:.2f}% locks +{trailing['locked_profit_pct']:.2f}%; {submission_detail}",
                             }
                         )
 
@@ -1826,7 +2413,21 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 report.builder.kpi("Feed", "OKX bbo-tbt 10ms + books 100ms")
                 report.builder.kpi("Signal", last_signal)
                 report.builder.kpi(
-                    "Position mode", "ONE SHOT · 20% MARGIN · NO SCALE-IN"
+                    "Tape trend",
+                    f"{structure['trend']} · rolling prints · {structure['trend_slope_bps']:+.2f} bps",
+                )
+                report.builder.kpi(
+                    "Volume-price sync",
+                    f"{volume_price['direction']} · {volume_price['price_change_bps']:+.2f} bps · x{volume_price['volume_ratio']:.2f} · delta {volume_price['signed_delta']:+.2f}",
+                )
+                report.builder.kpi("VWAP", f"{structure['vwap']:.2f}")
+                report.builder.kpi(
+                    "VP POC / VAL / VAH",
+                    f"{structure['poc']:.2f} / {structure['val']:.2f} / {structure['vah']:.2f}",
+                )
+                report.builder.kpi("Liquidity void", current_liquidity_void)
+                report.builder.kpi(
+                    "Position mode", "CONTINUOUS MAKER · 20% · ONE POSITION"
                 )
                 report.builder.kpi(
                     "Account ETH positions", str(len(account_positions))
@@ -1860,6 +2461,10 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 report.builder.kpi("Bid iceberg", f"{intent.get('bid_iceberg', 0):.2f}")
                 report.builder.kpi("Ask iceberg", f"{intent.get('ask_iceberg', 0):.2f}")
                 report.builder.kpi(
+                    "Absorption",
+                    f"bid {intent.get('bid_intent', 0):.2f} / ask {intent.get('ask_intent', 0):.2f}",
+                )
+                report.builder.kpi(
                     "Trailing protection",
                     (
                         f"arm +{last_trailing['activation_pct']:.2f}% / "
@@ -1883,8 +2488,21 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             controller_ids=[config.controller_id],
             limit=500,
         )
-        await _stop_active(client, _executor_rows(payload))
-        return "Stopped; ETH demo executors were asked to close and research data was preserved"
+        for row in _executor_rows(payload):
+            if str(row.get("status") or "").upper() not in {"RUNNING", "CREATED"}:
+                continue
+            executor_id = row.get("id") or row.get("executor_id")
+            if executor_id:
+                try:
+                    # Cancelling a routine must never turn into a market close.
+                    # A late fill remains a venue position for the next run to
+                    # adopt and close with an explicit passive order.
+                    await client.executors.stop_executor(
+                        str(executor_id), keep_position=True
+                    )
+                except Exception:
+                    pass
+        return "Stopped; passive entries were cancelled without market exits and research data was preserved"
     finally:
         stream_task.cancel()
         await asyncio.gather(stream_task, return_exceptions=True)

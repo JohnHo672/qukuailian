@@ -12,27 +12,39 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     TAKE_PROFIT_ORDER_TYPE,
     WallState,
     account_position_direction,
+    account_position_tracker_key,
     active_reserved_margin,
     dom_signal,
     dynamic_barriers,
     depth_limited_margin,
     detect_retail_stop_run,
-    emergency_exit_reason,
+    entry_location_is_valid,
     executor_direction,
+    executor_filled_base_amount,
     executor_lifecycle,
     executor_submission_status,
     favorable_move_pct,
     fee_covered_trailing_barrier,
     infer_dom_intent,
+    liquidity_void_direction,
+    losing_trade_exit_reason,
     market_depth_metrics,
+    matched_executor_close_amount,
     maker_close_price,
+    maker_entry_price,
+    maker_only_executor_barrier_kwargs,
     one_shot_position_margin,
+    orderflow_structure,
+    orphan_order_ids_to_cancel,
     pair_active_order_rows,
     pair_position_rows,
+    partial_maker_exit_should_retry,
     pending_entry_should_expire,
     protected_exit_reason,
+    quantize_close_amount,
     shutdown_blocks_entry,
     should_exit,
+    volume_price_synchronization,
 )
 
 
@@ -43,15 +55,24 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
     assert config.leverage == 10
     assert config.position_margin_pct == 20
     assert config.max_positions == 1
-    assert config.time_limit_seconds == 30
-    assert config.min_seconds_between_entries == 10
-    assert config.unfilled_shutdown_grace_seconds == 10
-    assert config.dust_position_notional_usdt == 5
-    assert config.entry_timeout_seconds == 5
-    assert config.exit_cooldown_seconds == 5
+    assert config.min_seconds_between_entries == 1
+    assert config.decision_interval_ms == 100
+    assert config.unfilled_shutdown_grace_seconds == 2
+    assert config.min_executable_position_amount_base == 0.001
+    assert config.entry_timeout_seconds == 1
+    assert config.exit_cooldown_seconds == 1
+    assert config.flat_confirmation_seconds == 2
+    assert config.max_entry_extension_bps == 8
+    assert config.volume_sync_window_seconds == 2
+    assert config.min_volume_acceleration_ratio == 1.05
+    assert config.min_price_sync_bps == 0.25
+    assert config.min_stop_pct == 0.05
+    assert config.early_invalidation_stop_pct == 0.06
+    assert config.max_stop_pct == 0.10
     assert ENTRY_ORDER_TYPE == 3
     assert TAKE_PROFIT_ORDER_TYPE == 3
-    assert RISK_EXIT_ORDER_TYPE == 1
+    assert RISK_EXIT_ORDER_TYPE == 3
+    assert maker_only_executor_barrier_kwargs() == {"open_order_type": 3}
     for unsafe in (
         {"connector_name": "okx_perpetual"},
         {"trading_pair": "BTC-USDT"},
@@ -145,9 +166,6 @@ def test_profitable_close_rests_on_the_passive_side():
     frame = BookFrame(time.time(), 2000, 1999.5, 2000.5, 0, 2000)
     assert maker_close_price("LONG", frame) == 2000.5
     assert maker_close_price("SHORT", frame) == 1999.5
-    assert emergency_exit_reason("defensive account hard-stop") is True
-    assert emergency_exit_reason("defensive account time limit") is True
-    assert emergency_exit_reason("retail short-stop pool reached") is False
 
 
 def test_persistent_replenished_wall_scores_as_intent_not_a_claim():
@@ -187,14 +205,208 @@ def test_dom_entry_requires_flow_value_intent_and_low_spoof_risk():
             "bid_spoof_risk": 0.1,
             "ask_spoof_risk": 0.8,
         },
-        depth={"depth_imbalance_10bps": 0.20},
+        depth={
+            "depth_imbalance_10bps": 0.20,
+            "bid_depth_25bps": 1000,
+            "ask_depth_25bps": 1000,
+            "bid_depth_concentration": 0.60,
+            "ask_depth_concentration": 0.20,
+        },
         sweep={"long_reclaim": False, "short_reclaim": False},
-        vwap=1995,
-        poc=1997,
+        vwap=1999.2,
+        poc=1999.5,
+        val=1998.5,
+        vah=2001,
+        trend="UP",
+        volume_price={"direction": "UP"},
         config=config,
     )
     assert result["direction"] == "LONG"
-    assert result["score"] == 7
+    assert result["score"] == 10
+
+
+def test_dom_entry_rejects_signal_without_directional_liquidity_void():
+    config = Config()
+    result = dom_signal(
+        frame=BookFrame(time.time(), 2000, 1999.5, 2000.5, 0.2, 2000.2),
+        flow={"buy_ratio": 0.62, "sell_ratio": 0.38},
+        intent={
+            "bid_intent": 0.75,
+            "ask_intent": 0.1,
+            "bid_iceberg": 0.65,
+            "ask_iceberg": 0.0,
+            "bid_spoof_risk": 0.1,
+            "ask_spoof_risk": 0.8,
+        },
+        depth={
+            "depth_imbalance_10bps": 0.20,
+            "bid_depth_25bps": 1000,
+            "ask_depth_25bps": 1000,
+            "bid_depth_concentration": 0.60,
+            "ask_depth_concentration": 0.60,
+        },
+        sweep={"long_reclaim": False, "short_reclaim": False},
+        vwap=1999.2,
+        poc=1999.5,
+        val=1998.5,
+        vah=2001,
+        trend="UP",
+        volume_price={"direction": "UP"},
+        config=config,
+    )
+    assert result["direction"] == "FLAT"
+
+
+def test_dom_entry_rejects_price_volume_divergence():
+    config = Config()
+    result = dom_signal(
+        frame=BookFrame(time.time(), 2000, 1999.5, 2000.5, 0.2, 2000.2),
+        flow={"buy_ratio": 0.62, "sell_ratio": 0.38},
+        intent={
+            "bid_intent": 0.75,
+            "ask_intent": 0.1,
+            "bid_iceberg": 0.65,
+            "ask_iceberg": 0.0,
+            "bid_spoof_risk": 0.1,
+            "ask_spoof_risk": 0.8,
+        },
+        depth={
+            "depth_imbalance_10bps": 0.20,
+            "bid_depth_25bps": 1000,
+            "ask_depth_25bps": 1000,
+            "bid_depth_concentration": 0.60,
+            "ask_depth_concentration": 0.20,
+        },
+        sweep={"long_reclaim": False, "short_reclaim": False},
+        vwap=1999.2,
+        poc=1999.5,
+        val=1998.5,
+        vah=2001,
+        trend="UP",
+        volume_price={"direction": "FLAT"},
+        config=config,
+    )
+    assert result["direction"] == "FLAT"
+
+
+def test_volume_price_sync_requires_price_move_volume_expansion_and_taker_delta():
+    now = 100.0
+    trades = deque()
+    for index in range(4):
+        trades.append(
+            {
+                "time": 96.2 + index * 0.4,
+                "price": 1999.8 + index * 0.02,
+                "size": 1.0,
+                "side": "sell" if index == 0 else "buy",
+            }
+        )
+    for index in range(8):
+        trades.append(
+            {
+                "time": 98.2 + index * 0.2,
+                "price": 2000.2 + index * 0.04,
+                "size": 1.0,
+                "side": "buy" if index < 7 else "sell",
+            }
+        )
+    sync = volume_price_synchronization(
+        trades,
+        now=now,
+        window_seconds=2,
+        min_volume_ratio=1.05,
+        min_price_bps=0.25,
+    )
+    assert sync["direction"] == "UP"
+    assert sync["price_change_bps"] > 0.25
+    assert sync["volume_ratio"] > 1.05
+    assert sync["signed_delta"] > 0
+
+    no_expansion = volume_price_synchronization(
+        deque(list(trades)[:4] + list(trades)[4:6]),
+        now=now,
+        window_seconds=2,
+        min_volume_ratio=1.05,
+        min_price_bps=0.25,
+    )
+    assert no_expansion["direction"] == "FLAT"
+
+
+def test_entry_location_rejects_chasing_beyond_vwap_and_profile():
+    assert entry_location_is_valid(
+        "LONG",
+        mid=2000,
+        vwap=1999.2,
+        poc=1999.5,
+        val=1998.5,
+        vah=2001,
+        max_extension_bps=8,
+    ) is True
+    assert entry_location_is_valid(
+        "LONG",
+        mid=2004,
+        vwap=1999.2,
+        poc=1999.5,
+        val=1998.5,
+        vah=2001,
+        max_extension_bps=8,
+    ) is False
+    assert entry_location_is_valid(
+        "SHORT",
+        mid=2000,
+        vwap=2000.8,
+        poc=2000.5,
+        val=1999,
+        vah=2001.5,
+        max_extension_bps=8,
+    ) is True
+
+
+def test_maker_entry_uses_nearest_structure_and_never_crosses():
+    frame = BookFrame(time.time(), 2000, 1999.9, 2000.1, 0, 2000)
+    rules = {"min_price_increment": 0.1}
+    assert maker_entry_price(
+        "LONG",
+        frame=frame,
+        vwap=1999.2,
+        poc=1999.7,
+        val=1998.8,
+        vah=2001.2,
+        intent={"bid_wall_price": 1999.76},
+        rules=rules,
+        max_offset_bps=8,
+    ) == 1999.7
+    assert maker_entry_price(
+        "SHORT",
+        frame=frame,
+        vwap=2000.8,
+        poc=2000.3,
+        val=1999,
+        vah=2001.2,
+        intent={"ask_wall_price": 2000.24},
+        rules=rules,
+        max_offset_bps=8,
+    ) == 2000.3
+
+
+def test_liquidity_void_direction_requires_one_thin_side_only():
+    base = {"bid_depth_25bps": 1000, "ask_depth_25bps": 1000}
+    assert liquidity_void_direction(
+        {**base, "bid_depth_concentration": 0.60, "ask_depth_concentration": 0.20},
+        max_near_concentration=0.35,
+    ) == "UP"
+    assert liquidity_void_direction(
+        {**base, "bid_depth_concentration": 0.20, "ask_depth_concentration": 0.60},
+        max_near_concentration=0.35,
+    ) == "DOWN"
+    assert liquidity_void_direction(
+        {**base, "bid_depth_concentration": 0.20, "ask_depth_concentration": 0.20},
+        max_near_concentration=0.35,
+    ) == "NONE"
+    assert liquidity_void_direction(
+        {**base, "bid_depth_concentration": 0.30, "ask_depth_concentration": 0.20},
+        max_near_concentration=0.35,
+    ) == "UP"
 
 
 def test_market_depth_is_measured_in_multiple_bands_and_limits_size():
@@ -264,17 +476,51 @@ def test_any_existing_eth_position_blocks_another_entry():
     assert account_position_direction({"side": "LONG", "amount": 1}) == "LONG"
 
 
-def test_uncloseable_position_dust_does_not_block_the_next_trade():
+def test_account_position_identity_ignores_demo_amount_jitter():
+    first = {"side": "SHORT", "amount": -0.1058, "entry_price": 2682.14}
+    later = {"side": "SHORT", "amount": -0.1059, "entry_price": 2682.14}
+    assert account_position_tracker_key(first) == account_position_tracker_key(later)
+
+
+def test_all_exchange_closeable_residuals_block_the_next_trade():
     payload = {
         "data": [
             {
                 "trading_pair": "ETH-USDT",
-                "amount": -0.0009,
+                "amount": -0.001,
                 "entry_price": 2700,
             }
         ]
     }
-    assert pair_position_rows(payload, min_notional_usdt=5) == []
+    assert pair_position_rows(payload, min_amount_base=0.001) == payload["data"]
+
+
+def test_only_sub_minimum_exchange_dust_is_non_blocking():
+    payload = {
+        "data": [
+            {
+                "trading_pair": "ETH-USDT",
+                "amount": -0.0005,
+                "entry_price": 2700,
+            }
+        ]
+    }
+    assert pair_position_rows(payload, min_amount_base=0.001) == []
+
+
+def test_close_amount_is_quantized_and_tolerates_minimum_lot_jitter():
+    rules = {
+        "min_order_size": 0.001,
+        "min_base_amount_increment": 0.001,
+        "min_notional_size": 0,
+        "min_order_value": 0,
+    }
+    assert quantize_close_amount(
+        base_amount=0.016005, price=2700, rules=rules
+    ) == 0.016
+    assert quantize_close_amount(
+        base_amount=0.0009995, price=2700, rules=rules
+    ) == 0.001
 
 
 def test_market_entry_is_not_cancelled_after_venue_position_appears():
@@ -312,6 +558,28 @@ def test_any_non_terminal_venue_order_blocks_the_pair():
     assert [row["order_id"] for row in pair_active_order_rows(payload)] == ["1", "2"]
 
 
+def test_flat_account_cancels_unowned_close_remainder_once():
+    orders = [{"client_order_id": "close-1"}, {"client_order_id": "close-2"}]
+    assert orphan_order_ids_to_cancel(
+        account_positions=[],
+        blocking_executors=[],
+        active_orders=orders,
+        already_requested={"close-1"},
+    ) == ["close-2"]
+    assert orphan_order_ids_to_cancel(
+        account_positions=[{"amount": 1}],
+        blocking_executors=[],
+        active_orders=orders,
+        already_requested=set(),
+    ) == []
+    assert orphan_order_ids_to_cancel(
+        account_positions=[],
+        blocking_executors=[{"status": "RUNNING"}],
+        active_orders=orders,
+        already_requested=set(),
+    ) == []
+
+
 def test_dynamic_barriers_use_profile_and_are_bounded():
     barriers = dynamic_barriers(
         direction="LONG",
@@ -323,9 +591,36 @@ def test_dynamic_barriers_use_profile_and_are_bounded():
         intent={"bid_wall_price": 1998, "ask_wall_price": 2012},
         config=Config(),
     )
-    assert 0.12 <= barriers["stop_loss_pct"] <= 0.35
+    assert 0.05 <= barriers["stop_loss_pct"] <= 0.10
     assert 0.18 <= barriers["take_profit_pct"] <= 0.60
     assert barriers["take_profit_pct"] >= barriers["stop_loss_pct"] * 1.20
+
+
+def test_orderflow_structure_builds_vwap_vp_and_direction_without_candles():
+    rising = [
+        {
+            "time": 61 + index,
+            "price": 2000 + index * 0.1,
+            "size": 1,
+            "side": "buy",
+        }
+        for index in range(40)
+    ]
+    falling = [
+        {
+            "time": 61 + index,
+            "price": 2004 - index * 0.1,
+            "size": 1,
+            "side": "sell",
+        }
+        for index in range(40)
+    ]
+    up = orderflow_structure(rising, mid=2004.1, now=101)
+    down = orderflow_structure(falling, mid=1999.9, now=101)
+    assert up["trend"] == "UP"
+    assert down["trend"] == "DOWN"
+    assert up["vwap"] > 0
+    assert up["val"] <= up["poc"] <= up["vah"]
 
 
 def test_trailing_stop_first_lock_covers_fees_and_buffer():
@@ -424,6 +719,21 @@ def test_executor_direction_accepts_live_strings_and_archived_numbers():
     assert executor_direction({"config": {"side": "unknown"}}) is None
 
 
+def test_close_amount_uses_actual_matching_fill_not_jittered_position():
+    row = {
+        "config": {"side": 2, "amount": 48.0, "entry_price": 2691.93},
+        "custom_info": {
+            "current_position_average_price": 2691.93,
+            "held_position_orders": [
+                {"position": "OPEN", "executed_amount_base": "47.592"}
+            ],
+        },
+    }
+    position = {"side": "SHORT", "amount": -48.0, "entry_price": 2691.93}
+    assert executor_filled_base_amount(row) == 47.592
+    assert matched_executor_close_amount(position, [row]) == 47.592
+
+
 def test_gross_winner_smaller_than_fees_is_not_discretionarily_closed():
     # A representative historical short moved +0.04% before exit, but its
     # observed round-trip fees were 0.07%, so closing crystallised a net loss.
@@ -459,6 +769,40 @@ def test_confirmed_soft_exit_requires_fee_covered_net_profit():
     ) == "profit liquidity target"
 
 
+def test_fee_covered_scalp_exits_without_waiting_for_anomaly():
+    assert protected_exit_reason(
+        candidate_reason=None,
+        candidate_confirmations=0,
+        required_confirmations=2,
+        current_gross_pct=0.085,
+        peak_gross_pct=0.085,
+        round_trip_fee_pct=0.07,
+        break_even_buffer_pct=0.01,
+        trailing_activation_pct=0.19,
+        trailing_delta_pct=0.09,
+        held_seconds=0.5,
+        minimum_hold_seconds=0.5,
+    ) == "fee-covered scalp target"
+
+
+def test_partial_maker_exit_retries_only_after_position_amount_decreases():
+    assert partial_maker_exit_should_retry(
+        submitted_amount=48.494,
+        remaining_amount=0.016,
+        has_active_order=False,
+    ) is True
+    assert partial_maker_exit_should_retry(
+        submitted_amount=48.494,
+        remaining_amount=48.494,
+        has_active_order=False,
+    ) is False
+    assert partial_maker_exit_should_retry(
+        submitted_amount=48.494,
+        remaining_amount=0.016,
+        has_active_order=True,
+    ) is False
+
+
 def test_liquidity_collapse_does_not_crystallise_a_noise_loss():
     assert protected_exit_reason(
         candidate_reason="defensive bid-liquidity collapse",
@@ -473,6 +817,27 @@ def test_liquidity_collapse_does_not_crystallise_a_noise_loss():
         held_seconds=1.5,
         minimum_hold_seconds=1,
     ) is None
+
+
+def test_losing_trade_exits_early_only_after_structural_invalidation():
+    assert losing_trade_exit_reason(
+        candidate_reason="defensive bid-liquidity collapse",
+        current_gross_pct=-0.061,
+        early_invalidation_stop_pct=0.06,
+        max_stop_pct=0.10,
+    ) == "early liquidity invalidation stop"
+    assert losing_trade_exit_reason(
+        candidate_reason=None,
+        current_gross_pct=-0.061,
+        early_invalidation_stop_pct=0.06,
+        max_stop_pct=0.10,
+    ) is None
+    assert losing_trade_exit_reason(
+        candidate_reason=None,
+        current_gross_pct=-0.101,
+        early_invalidation_stop_pct=0.06,
+        max_stop_pct=0.10,
+    ) == "defensive account hard-stop"
 
 
 def test_first_fee_covered_liquidity_anomaly_exits_immediately():
