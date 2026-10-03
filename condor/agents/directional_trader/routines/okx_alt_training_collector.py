@@ -41,7 +41,7 @@ SCHEMA_VERSION = "okx-alt-cross-section-v1"
 ETH_INST_ID = "ETH-USDT-SWAP"
 DEFAULT_EXCLUDES = (
     "BTC,SOL,BNB,XRP,DOGE,ADA,TRX,TON,LINK,AVAX,BCH,LTC,DOT,SUI,"
-    "USDT,USDC,DAI,FDUSD,TUSD,USDE,PYUSD"
+    "USDT,USDC,DAI,FDUSD,TUSD,USDE,PYUSD,XAU,XAG"
 )
 LABEL_HORIZONS = (1, 5, 15, 30)
 
@@ -592,7 +592,6 @@ async def _collect_generation(
             if now - last_report_at >= 10:
                 stale = sum(now - state.last_book_at > 5 for state in states.values())
                 report.clear()
-                report.builder.h1("OKX Alt Cross-Section Training Collector")
                 report.builder.kpi("Mode", "READ ONLY · NO ORDER API")
                 report.builder.kpi("Schema", SCHEMA_VERSION)
                 report.builder.kpi("Alt universe", str(len(states) - 1))
