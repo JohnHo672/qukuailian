@@ -14,6 +14,8 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     account_position_direction,
     account_position_tracker_key,
     active_reserved_margin,
+    adaptive_market_signal,
+    classify_market_regime,
     dom_signal,
     dynamic_barriers,
     depth_limited_margin,
@@ -22,6 +24,7 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     executor_direction,
     executor_filled_base_amount,
     executor_lifecycle,
+    executor_strategy,
     executor_submission_status,
     favorable_move_pct,
     fee_covered_trailing_barrier,
@@ -42,8 +45,11 @@ from agents.directional_trader.routines.okx_eth_dom_research import (
     pending_entry_should_expire,
     protected_exit_reason,
     quantize_close_amount,
+    range_reversion_signal,
     shutdown_blocks_entry,
     should_exit,
+    strategy_adjusted_barriers,
+    strategy_loss_limits,
     volume_price_synchronization,
 )
 
@@ -66,6 +72,8 @@ def test_config_is_demo_eth_only_with_one_twenty_percent_position():
     assert config.volume_sync_window_seconds == 2
     assert config.min_volume_acceleration_ratio == 1.05
     assert config.min_price_sync_bps == 0.25
+    assert config.breakout_volume_ratio == 1.30
+    assert config.min_range_width_bps == 12
     assert config.min_stop_pct == 0.05
     assert config.early_invalidation_stop_pct == 0.06
     assert config.max_stop_pct == 0.10
@@ -387,6 +395,110 @@ def test_maker_entry_uses_nearest_structure_and_never_crosses():
         rules=rules,
         max_offset_bps=8,
     ) == 2000.3
+
+
+def test_market_regime_routes_breakout_trend_range_and_wait():
+    config = Config()
+    frame = BookFrame(time.time(), 2000.5, 2000.4, 2000.6, 0.2, 2000.55)
+    breakout = classify_market_regime(
+        frame=frame,
+        depth={"depth_imbalance_10bps": 0.20},
+        structure={"trend": "UP", "val": 1998, "vah": 2000},
+        volume_price={"direction": "UP", "volume_ratio": 1.5},
+        liquidity_void="UP",
+        config=config,
+    )
+    assert breakout["regime"] == "BREAKOUT_UP"
+    assert breakout["strategy"] == "BREAKOUT_RETEST"
+
+    trend = classify_market_regime(
+        frame=BookFrame(time.time(), 1999.5, 1999.4, 1999.6, 0.2, 1999.55),
+        depth={"depth_imbalance_10bps": 0.20},
+        structure={"trend": "UP", "val": 1998, "vah": 2000},
+        volume_price={"direction": "UP", "volume_ratio": 1.1},
+        liquidity_void="UP",
+        config=config,
+    )
+    assert trend["strategy"] == "TREND_PULLBACK"
+
+    ranged = classify_market_regime(
+        frame=frame,
+        depth={"depth_imbalance_10bps": 0},
+        structure={"trend": "FLAT", "val": 1998, "vah": 2001},
+        volume_price={"direction": "FLAT", "volume_ratio": 0.9},
+        liquidity_void="NONE",
+        config=config,
+    )
+    assert ranged["strategy"] == "VP_EDGE_REVERSION"
+
+    wait = classify_market_regime(
+        frame=frame,
+        depth={"depth_imbalance_10bps": 0},
+        structure={"trend": "UP", "val": 1998, "vah": 2001},
+        volume_price={"direction": "DOWN", "volume_ratio": 1.5},
+        liquidity_void="NONE",
+        config=config,
+    )
+    assert wait["strategy"] == "WAIT"
+
+
+def test_range_strategy_only_enters_at_defended_profile_edge():
+    config = Config()
+    frame = BookFrame(time.time(), 1998.1, 1998.0, 1998.2, 0.2, 1998.15)
+    signal = range_reversion_signal(
+        frame=frame,
+        flow={"buy_ratio": 0.60, "sell_ratio": 0.40},
+        intent={"bid_intent": 0.75, "bid_spoof_risk": 0.1},
+        structure={"val": 1998, "vah": 2001},
+        volume_price={"direction": "FLAT"},
+        config=config,
+    )
+    assert signal["direction"] == "LONG"
+    away_from_edge = range_reversion_signal(
+        frame=BookFrame(time.time(), 1999.5, 1999.4, 1999.6, 0.2, 1999.55),
+        flow={"buy_ratio": 0.60, "sell_ratio": 0.40},
+        intent={"bid_intent": 0.75, "bid_spoof_risk": 0.1},
+        structure={"val": 1998, "vah": 2001},
+        volume_price={"direction": "FLAT"},
+        config=config,
+    )
+    assert away_from_edge["direction"] == "FLAT"
+
+
+def test_adaptive_signal_selects_range_strategy_and_tighter_risk():
+    config = Config()
+    frame = BookFrame(time.time(), 1998.1, 1998.0, 1998.2, 0.2, 1998.15)
+    signal = adaptive_market_signal(
+        frame=frame,
+        flow={"buy_ratio": 0.60, "sell_ratio": 0.40},
+        intent={"bid_intent": 0.75, "bid_spoof_risk": 0.1},
+        depth={
+            "depth_imbalance_10bps": 0,
+            "bid_depth_25bps": 1000,
+            "ask_depth_25bps": 1000,
+            "bid_depth_concentration": 0.6,
+            "ask_depth_concentration": 0.6,
+        },
+        sweep={"long_reclaim": False, "short_reclaim": False},
+        structure={
+            "trend": "FLAT",
+            "vwap": 1999.5,
+            "poc": 1999.5,
+            "val": 1998,
+            "vah": 2001,
+        },
+        volume_price={"direction": "FLAT", "volume_ratio": 0.9},
+        config=config,
+    )
+    assert signal["direction"] == "LONG"
+    assert signal["strategy"] == "VP_EDGE_REVERSION"
+    assert strategy_loss_limits("VP_EDGE_REVERSION", config) == (0.04, 0.06)
+    adjusted = strategy_adjusted_barriers(
+        "VP_EDGE_REVERSION",
+        {"stop_loss_pct": 0.10, "take_profit_pct": 0.50},
+        config,
+    )
+    assert adjusted == {"stop_loss_pct": 0.06, "take_profit_pct": 0.30}
 
 
 def test_liquidity_void_direction_requires_one_thin_side_only():
@@ -717,6 +829,16 @@ def test_executor_direction_accepts_live_strings_and_archived_numbers():
     assert executor_direction({"config": {"side": 1}}) == "LONG"
     assert executor_direction({"config": {"side": 2}}) == "SHORT"
     assert executor_direction({"config": {"side": "unknown"}}) is None
+
+
+def test_executor_strategy_recovers_encoded_regime_playbook():
+    assert executor_strategy(
+        {"config": {"level_id": "eth-dom-breakout-retest"}}
+    ) == "BREAKOUT_RETEST"
+    assert executor_strategy(
+        {"config": {"level_id": "eth-dom-vp-edge-reversion"}}
+    ) == "VP_EDGE_REVERSION"
+    assert executor_strategy({"config": {"level_id": "eth-dom-trend-pullback"}}) == "TREND_PULLBACK"
 
 
 def test_close_amount_uses_actual_matching_fill_not_jittered_position():
