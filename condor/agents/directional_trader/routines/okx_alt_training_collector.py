@@ -22,7 +22,6 @@ import os
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Deque
@@ -78,15 +77,24 @@ class Config(BaseModel):
         )
 
 
-@dataclass(slots=True)
 class InstrumentMeta:
-    inst_id: str
-    base: str
-    ct_val: float
-    ct_mult: float
-    tick_size: float
-    lot_size: float
-    listing_time: float
+    def __init__(
+        self,
+        inst_id: str,
+        base: str,
+        ct_val: float,
+        ct_mult: float,
+        tick_size: float,
+        lot_size: float,
+        listing_time: float,
+    ) -> None:
+        self.inst_id = inst_id
+        self.base = base
+        self.ct_val = ct_val
+        self.ct_mult = ct_mult
+        self.tick_size = tick_size
+        self.lot_size = lot_size
+        self.listing_time = listing_time
 
     @property
     def base_per_contract(self) -> float:
@@ -94,24 +102,26 @@ class InstrumentMeta:
         return value if value > 0 else 1.0
 
 
-@dataclass(slots=True)
 class MarketState:
-    meta: InstrumentMeta
-    turnover_usdt_24h: float
-    change_pct_24h: float
-    ticker_spread_bps: float
-    bids: list[tuple[float, float]] = field(default_factory=list)
-    asks: list[tuple[float, float]] = field(default_factory=list)
-    trades: Deque[dict[str, float | str]] = field(
-        default_factory=lambda: deque(maxlen=20_000)
-    )
-    frames: Deque[tuple[float, float]] = field(
-        default_factory=lambda: deque(maxlen=120)
-    )
-    pending: Deque[dict[str, Any]] = field(default_factory=deque)
-    history: dict[str, Deque[float]] = field(default_factory=dict)
-    last_book_at: float = 0.0
-    last_trade_at: float = 0.0
+    def __init__(
+        self,
+        meta: InstrumentMeta,
+        turnover_usdt_24h: float,
+        change_pct_24h: float,
+        ticker_spread_bps: float,
+    ) -> None:
+        self.meta = meta
+        self.turnover_usdt_24h = turnover_usdt_24h
+        self.change_pct_24h = change_pct_24h
+        self.ticker_spread_bps = ticker_spread_bps
+        self.bids: list[tuple[float, float]] = []
+        self.asks: list[tuple[float, float]] = []
+        self.trades: Deque[dict[str, float | str]] = deque(maxlen=20_000)
+        self.frames: Deque[tuple[float, float]] = deque(maxlen=120)
+        self.pending: Deque[dict[str, Any]] = deque()
+        self.history: dict[str, Deque[float]] = {}
+        self.last_book_at = 0.0
+        self.last_trade_at = 0.0
 
     def update_book(self, data: dict[str, Any]) -> None:
         self.bids = _levels(data.get("bids"), reverse=True)
