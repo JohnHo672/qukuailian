@@ -7,6 +7,7 @@ from agents.directional_trader.routines.okx_alt_training_collector import (
     Config,
     InstrumentMeta,
     MarketState,
+    ROLLING_KEYS,
     SCHEMA_VERSION,
     add_benchmark_context,
     add_percentiles,
@@ -67,6 +68,7 @@ def test_universe_is_liquid_non_major_and_keeps_eth_benchmark():
         ],
         instruments,
         now=now,
+        spot_bases={"ETH", "AAA", "BBB", "BTC", "WIDE", "NEW"},
         excluded={"BTC"},
         size=2,
         min_turnover=5_000_000,
@@ -95,6 +97,13 @@ def test_features_are_scale_normalized_and_notional_aware():
             "asks": [["100.1", "10"], ["100.3", "10"]],
         }
     )
+    state.update_book(
+        {
+            "ts": "99900",
+            "bids": [["100", "15"], ["99.9", "12"]],
+            "asks": [["100.1", "12"], ["100.3", "8"]],
+        }
+    )
     state.add_trades(
         [
             {"ts": "99000", "px": "100", "sz": "10", "side": "buy"},
@@ -108,6 +117,9 @@ def test_features_are_scale_normalized_and_notional_aware():
     assert -1 <= row["obi_top5"] <= 1
     assert row["depth_total_top5_usdt"] > 0
     assert 0 <= row["buy_ratio"] <= 1
+    assert row["book_update_count_5s"] == 1
+    assert row["bid_depth_removed_5s_usdt"] > 0
+    assert 0 <= row["bid_cancel_proxy_ratio_5s"] <= 1
 
 
 def test_percentiles_and_eth_context_are_added():
@@ -117,14 +129,20 @@ def test_percentiles_and_eth_context_are_added():
         meta_a.inst_id: MarketState(meta_a, 1, 0, 1),
         meta_e.inst_id: MarketState(meta_e, 1, 0, 1),
     }
-    template = {key: 1.0 for key in (
-        "spread_bps", "depth_total_top5_usdt", "obi_top5", "volume_multiple",
-        "trade_notional_5s", "microprice_bps", "up_liquidity_gap_bps",
-        "down_liquidity_gap_bps",
-    )}
+    template = {key: 1.0 for key in ROLLING_KEYS}
     rows = [
-        {"inst_id": meta_a.inst_id, "is_benchmark": False, "trade_return_5s_bps": 2.0, **template},
-        {"inst_id": meta_e.inst_id, "is_benchmark": True, "trade_return_5s_bps": 3.0, **template},
+        {
+            "inst_id": meta_a.inst_id,
+            "is_benchmark": False,
+            "trade_return_5s_bps": 2.0,
+            **template,
+        },
+        {
+            "inst_id": meta_e.inst_id,
+            "is_benchmark": True,
+            "trade_return_5s_bps": 3.0,
+            **template,
+        },
     ]
     add_percentiles(rows, states, 300)
     add_benchmark_context(rows)
@@ -135,13 +153,75 @@ def test_percentiles_and_eth_context_are_added():
 
 def test_delayed_labels_include_fee_adjusted_long_and_short_targets():
     config = Config(maker_fee_bps_per_side=2)
-    pending = {"timestamp": 100.0, "mid": 100.0}
-    frames = deque([(101.0, 101.0), (105.0, 102.0), (115.0, 99.0), (130.0, 104.0)])
-    row = labelled_row(pending, frames, config)
+    pending = {
+        "timestamp": 100.0,
+        "mid": 100.0,
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+    }
+    frames = deque(
+        [
+            {"timestamp": 101.0, "mid": 101.0, "bid": 100.9, "ask": 101.1},
+            {"timestamp": 105.0, "mid": 102.0, "bid": 101.9, "ask": 102.1},
+            {"timestamp": 115.0, "mid": 99.0, "bid": 98.9, "ask": 99.1},
+            {"timestamp": 130.0, "mid": 104.0, "bid": 103.9, "ask": 104.1},
+        ]
+    )
+    trades = deque(
+        [
+            {
+                "timestamp": 102.0,
+                "price": 99.9,
+                "side": "sell",
+                "quote_notional": 10.0,
+            },
+            {
+                "timestamp": 103.0,
+                "price": 100.1,
+                "side": "buy",
+                "quote_notional": 10.0,
+            },
+        ]
+    )
+    row = labelled_row(pending, frames, trades, config)
     assert row is not None
     assert round(row["future_return_30s_bps"], 6) == 400.0
     assert round(row["future_long_net_maker_30s_bps"], 6) == 396.0
     assert round(row["future_short_net_maker_30s_bps"], 6) == -404.0
+    assert row["long_maker_entry_fill_proxy_1s"] == 0
+    assert row["long_maker_entry_fill_proxy_5s"] == 1
+    assert row["short_maker_entry_fill_proxy_5s"] == 1
+    assert row["future_long_maker_entry_taker_exit_net_30s_bps"] > 0
+
+
+def test_universe_rejects_perpetual_without_crypto_spot_market():
+    now = 100 * 86400
+    instruments = instrument_map(
+        [
+            _instrument("AAA-USDT-SWAP"),
+            _instrument("SOXL-USDT-SWAP"),
+            _instrument("ETH-USDT-SWAP"),
+        ]
+    )
+    selected = select_universe(
+        [
+            _ticker("AAA-USDT-SWAP", 20_000_000),
+            _ticker("SOXL-USDT-SWAP", 50_000_000),
+            _ticker("ETH-USDT-SWAP", 100_000_000),
+        ],
+        instruments,
+        now=now,
+        spot_bases={"AAA", "ETH"},
+        excluded=set(),
+        size=1,
+        min_turnover=5_000_000,
+        max_spread_bps=12,
+        min_listing_days=30,
+    )
+    assert [item["inst_id"] for item in selected] == [
+        "AAA-USDT-SWAP",
+        "ETH-USDT-SWAP",
+    ]
 
 
 def test_collector_source_has_no_private_trading_dependency():

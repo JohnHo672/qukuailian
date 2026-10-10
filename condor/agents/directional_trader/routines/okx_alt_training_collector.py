@@ -37,7 +37,7 @@ CONTINUOUS = True
 
 OKX_REST = "https://www.okx.com"
 OKX_PUBLIC_WS = "wss://ws.okx.com/ws/v5/public"
-SCHEMA_VERSION = "okx-alt-cross-section-v1"
+SCHEMA_VERSION = "okx-alt-cross-section-v2"
 ETH_INST_ID = "ETH-USDT-SWAP"
 DEFAULT_EXCLUDES = (
     "BTC,SOL,BNB,XRP,DOGE,ADA,TRX,TON,LINK,AVAX,BCH,LTC,DOT,SUI,"
@@ -67,7 +67,7 @@ class Config(BaseModel):
     rolling_window_samples: int = Field(default=1800, ge=300, le=20_000)
     maker_fee_bps_per_side: float = Field(default=2.0, ge=-2, le=20)
     taker_fee_bps_per_side: float = Field(default=5.0, ge=0, le=30)
-    data_dir: str = Field(default="data/research/alt_cross_section")
+    data_dir: str = Field(default="data/research/alt_cross_section_v2")
 
     @field_validator("excluded_bases")
     @classmethod
@@ -117,17 +117,68 @@ class MarketState:
         self.bids: list[tuple[float, float]] = []
         self.asks: list[tuple[float, float]] = []
         self.trades: Deque[dict[str, float | str]] = deque(maxlen=20_000)
-        self.frames: Deque[tuple[float, float]] = deque(maxlen=120)
+        self.frames: Deque[dict[str, float]] = deque(maxlen=120)
+        self.book_events: Deque[dict[str, float]] = deque(maxlen=20_000)
         self.pending: Deque[dict[str, Any]] = deque()
         self.history: dict[str, Deque[float]] = {}
         self.last_book_at = 0.0
         self.last_trade_at = 0.0
 
     def update_book(self, data: dict[str, Any]) -> None:
-        self.bids = _levels(data.get("bids"), reverse=True)
-        self.asks = _levels(data.get("asks"), reverse=False)
+        bids = _levels(data.get("bids"), reverse=True)
+        asks = _levels(data.get("asks"), reverse=False)
+        if not bids or not asks:
+            return
+        timestamp = _number(data.get("ts")) / 1000 or time.time()
         if self.bids and self.asks:
-            self.last_book_at = _number(data.get("ts")) / 1000 or time.time()
+            previous_bid = {price: size for price, size in self.bids}
+            previous_ask = {price: size for price, size in self.asks}
+            current_bid = {price: size for price, size in bids}
+            current_ask = {price: size for price, size in asks}
+            base_value = self.meta.base_per_contract
+
+            def changes(
+                previous: dict[float, float], current: dict[float, float]
+            ) -> tuple[float, float]:
+                added = removed = 0.0
+                for price in previous.keys() | current.keys():
+                    delta = current.get(price, 0.0) - previous.get(price, 0.0)
+                    notional = price * abs(delta) * base_value
+                    if delta > 0:
+                        added += notional
+                    elif delta < 0:
+                        removed += notional
+                return added, removed
+
+            bid_added, bid_removed = changes(previous_bid, current_bid)
+            ask_added, ask_removed = changes(previous_ask, current_ask)
+            bid_depth = sum(price * size * base_value for price, size in bids)
+            ask_depth = sum(price * size * base_value for price, size in asks)
+            total_depth = bid_depth + ask_depth
+            spread_bps = (asks[0][0] / bids[0][0] - 1) * 10_000
+            self.book_events.append(
+                {
+                    "timestamp": timestamp,
+                    "bid_added_usdt": bid_added,
+                    "bid_removed_usdt": bid_removed,
+                    "ask_added_usdt": ask_added,
+                    "ask_removed_usdt": ask_removed,
+                    "bid_depth_usdt": bid_depth,
+                    "ask_depth_usdt": ask_depth,
+                    "obi": (
+                        (bid_depth - ask_depth) / total_depth
+                        if total_depth > 0
+                        else 0.0
+                    ),
+                    "spread_bps": spread_bps,
+                    "top_changed": float(
+                        bids[0][0] != self.bids[0][0] or asks[0][0] != self.asks[0][0]
+                    ),
+                }
+            )
+        self.bids = bids
+        self.asks = asks
+        self.last_book_at = timestamp
 
     def add_trades(self, rows: list[dict[str, Any]]) -> None:
         for raw in rows:
@@ -142,9 +193,7 @@ class MarketState:
                     "timestamp": timestamp,
                     "price": price,
                     "contracts": contracts,
-                    "quote_notional": (
-                        contracts * self.meta.base_per_contract * price
-                    ),
+                    "quote_notional": (contracts * self.meta.base_per_contract * price),
                     "side": side,
                 }
             )
@@ -195,6 +244,7 @@ def select_universe(
     tickers: list[dict[str, Any]],
     instruments: dict[str, InstrumentMeta],
     *,
+    spot_bases: set[str],
     now: float,
     excluded: set[str],
     size: int,
@@ -232,6 +282,10 @@ def select_universe(
             continue
         if meta.base in excluded:
             continue
+        # Stock, ETF and commodity perpetuals do not have a live BASE-USDT
+        # crypto spot market. Requiring one is more durable than a ticker denylist.
+        if meta.base not in spot_bases:
+            continue
         if (
             turnover < min_turnover
             or spread_bps > max_spread_bps
@@ -264,18 +318,21 @@ def _trade_metrics(state: MarketState, now: float) -> dict[str, float]:
             "buy_ratio": 0.5,
             "trade_vwap": 0.0,
             "trade_return_5s_bps": 0.0,
+            "buy_notional_5s": 0.0,
+            "sell_notional_5s": 0.0,
+            "trade_count_5s": 0.0,
         }
     recent = [row for row in rows if now - float(row["timestamp"]) <= 5]
     prior = [row for row in rows if 5 < now - float(row["timestamp"]) <= 60]
     total = sum(float(row["quote_notional"]) for row in rows)
     recent_total = sum(float(row["quote_notional"]) for row in recent)
     prior_total = sum(float(row["quote_notional"]) for row in prior)
-    buy = sum(
-        float(row["quote_notional"]) for row in rows if row["side"] == "buy"
+    buy = sum(float(row["quote_notional"]) for row in rows if row["side"] == "buy")
+    buy_5s = sum(float(row["quote_notional"]) for row in recent if row["side"] == "buy")
+    sell_5s = sum(
+        float(row["quote_notional"]) for row in recent if row["side"] == "sell"
     )
-    weighted = sum(
-        float(row["price"]) * float(row["quote_notional"]) for row in rows
-    )
+    weighted = sum(float(row["price"]) * float(row["quote_notional"]) for row in rows)
     recent_rate = recent_total / 5
     prior_rate = prior_total / 55 if prior else 0.0
     first_price = float(recent[0]["price"]) if recent else float(rows[-1]["price"])
@@ -289,6 +346,66 @@ def _trade_metrics(state: MarketState, now: float) -> dict[str, float]:
         "trade_return_5s_bps": (
             (last_price / first_price - 1) * 10_000 if first_price > 0 else 0.0
         ),
+        "buy_notional_5s": buy_5s,
+        "sell_notional_5s": sell_5s,
+        "trade_count_5s": float(len(recent)),
+    }
+
+
+def _book_change_metrics(
+    state: MarketState, now: float, trades: dict[str, float]
+) -> dict[str, float]:
+    recent = [
+        event for event in state.book_events if now - float(event["timestamp"]) <= 5
+    ]
+    if not recent:
+        return {
+            "book_update_count_5s": 0.0,
+            "top_of_book_change_count_5s": 0.0,
+            "bid_depth_added_5s_usdt": 0.0,
+            "bid_depth_removed_5s_usdt": 0.0,
+            "ask_depth_added_5s_usdt": 0.0,
+            "ask_depth_removed_5s_usdt": 0.0,
+            "bid_cancel_proxy_5s_usdt": 0.0,
+            "ask_cancel_proxy_5s_usdt": 0.0,
+            "bid_cancel_proxy_ratio_5s": 0.0,
+            "ask_cancel_proxy_ratio_5s": 0.0,
+            "depth_churn_to_trade_5s": 0.0,
+            "net_liquidity_change_5s_usdt": 0.0,
+            "obi_change_5s": 0.0,
+            "spread_change_5s_bps": 0.0,
+        }
+    bid_added = sum(float(item["bid_added_usdt"]) for item in recent)
+    bid_removed = sum(float(item["bid_removed_usdt"]) for item in recent)
+    ask_added = sum(float(item["ask_added_usdt"]) for item in recent)
+    ask_removed = sum(float(item["ask_removed_usdt"]) for item in recent)
+    bid_cancel = max(bid_removed - trades["sell_notional_5s"], 0.0)
+    ask_cancel = max(ask_removed - trades["buy_notional_5s"], 0.0)
+    churn = bid_added + bid_removed + ask_added + ask_removed
+    return {
+        "book_update_count_5s": float(len(recent)),
+        "top_of_book_change_count_5s": sum(
+            float(item["top_changed"]) for item in recent
+        ),
+        "bid_depth_added_5s_usdt": bid_added,
+        "bid_depth_removed_5s_usdt": bid_removed,
+        "ask_depth_added_5s_usdt": ask_added,
+        "ask_depth_removed_5s_usdt": ask_removed,
+        "bid_cancel_proxy_5s_usdt": bid_cancel,
+        "ask_cancel_proxy_5s_usdt": ask_cancel,
+        "bid_cancel_proxy_ratio_5s": (
+            bid_cancel / bid_removed if bid_removed > 0 else 0.0
+        ),
+        "ask_cancel_proxy_ratio_5s": (
+            ask_cancel / ask_removed if ask_removed > 0 else 0.0
+        ),
+        "depth_churn_to_trade_5s": churn / max(trades["trade_notional_5s"], 1.0),
+        "net_liquidity_change_5s_usdt": (
+            bid_added + ask_added - bid_removed - ask_removed
+        ),
+        "obi_change_5s": float(recent[-1]["obi"]) - float(recent[0]["obi"]),
+        "spread_change_5s_bps": float(recent[-1]["spread_bps"])
+        - float(recent[0]["spread_bps"]),
     }
 
 
@@ -320,6 +437,7 @@ def compute_features(state: MarketState, *, now: float) -> dict[str, Any] | None
         if state.bids[i + 1][0] > 0
     ]
     trades = _trade_metrics(state, now)
+    book_changes = _book_change_metrics(state, now, trades)
     row: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "timestamp": now,
@@ -327,6 +445,10 @@ def compute_features(state: MarketState, *, now: float) -> dict[str, Any] | None
         "base": state.meta.base,
         "is_benchmark": state.meta.inst_id == ETH_INST_ID,
         "mid": mid,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "best_bid_size_usdt": best_bid * bid_top * base_per_contract,
+        "best_ask_size_usdt": best_ask * ask_top * base_per_contract,
         "spread_bps": (best_ask / best_bid - 1) * 10_000,
         "microprice_bps": (microprice / mid - 1) * 10_000,
         "obi_top5": obi,
@@ -348,6 +470,7 @@ def compute_features(state: MarketState, *, now: float) -> dict[str, Any] | None
         "tick_size_bps": state.meta.tick_size / mid * 10_000,
         "contract_base_value": base_per_contract,
         **trades,
+        **book_changes,
     }
     return row
 
@@ -361,6 +484,11 @@ ROLLING_KEYS = (
     "microprice_bps",
     "up_liquidity_gap_bps",
     "down_liquidity_gap_bps",
+    "bid_cancel_proxy_ratio_5s",
+    "ask_cancel_proxy_ratio_5s",
+    "depth_churn_to_trade_5s",
+    "obi_change_5s",
+    "net_liquidity_change_5s_usdt",
 )
 
 
@@ -396,17 +524,25 @@ def add_benchmark_context(rows: list[dict[str, Any]]) -> None:
 
 
 def labelled_row(
-    pending: dict[str, Any], frames: Deque[tuple[float, float]], config: Config
+    pending: dict[str, Any],
+    frames: Deque[dict[str, float]],
+    trades: Deque[dict[str, float | str]],
+    config: Config,
 ) -> dict[str, Any] | None:
     base_time, base_mid = float(pending["timestamp"]), float(pending["mid"])
-    if not frames or frames[-1][0] < base_time + max(LABEL_HORIZONS):
+    if not frames or frames[-1]["timestamp"] < base_time + max(LABEL_HORIZONS):
         return None
     output = dict(pending)
+    entry_bid = float(pending["best_bid"])
+    entry_ask = float(pending["best_ask"])
     for horizon in LABEL_HORIZONS:
-        candidates = [item for item in frames if item[0] >= base_time + horizon]
+        candidates = [
+            item for item in frames if item["timestamp"] >= base_time + horizon
+        ]
         if not candidates:
             return None
-        future_mid = min(candidates, key=lambda item: item[0])[1]
+        future = min(candidates, key=lambda item: item["timestamp"])
+        future_mid = float(future["mid"])
         raw_return = (future_mid / base_mid - 1) * 10_000
         output[f"future_return_{horizon}s_bps"] = raw_return
         output[f"future_long_net_maker_{horizon}s_bps"] = (
@@ -415,12 +551,61 @@ def labelled_row(
         output[f"future_short_net_maker_{horizon}s_bps"] = (
             -raw_return - 2 * config.maker_fee_bps_per_side
         )
-    output["estimated_round_trip_maker_cost_bps"] = (
-        2 * config.maker_fee_bps_per_side
-    )
-    output["estimated_round_trip_taker_cost_bps"] = (
-        2 * config.taker_fee_bps_per_side
-    )
+        window_trades = [
+            item
+            for item in trades
+            if base_time < float(item["timestamp"]) <= base_time + horizon
+        ]
+        long_fills = [
+            item
+            for item in window_trades
+            if item["side"] == "sell" and float(item["price"]) <= entry_bid
+        ]
+        short_fills = [
+            item
+            for item in window_trades
+            if item["side"] == "buy" and float(item["price"]) >= entry_ask
+        ]
+        long_filled = bool(long_fills)
+        short_filled = bool(short_fills)
+        output[f"long_maker_entry_fill_proxy_{horizon}s"] = int(long_filled)
+        output[f"short_maker_entry_fill_proxy_{horizon}s"] = int(short_filled)
+        output[f"long_maker_entry_fill_delay_ms_{horizon}s"] = (
+            (float(long_fills[0]["timestamp"]) - base_time) * 1000
+            if long_filled
+            else -1.0
+        )
+        output[f"short_maker_entry_fill_delay_ms_{horizon}s"] = (
+            (float(short_fills[0]["timestamp"]) - base_time) * 1000
+            if short_filled
+            else -1.0
+        )
+        # Conservative executable label: maker entry must be touched by an
+        # opposite-side trade, then the horizon exit crosses the spread as a
+        # taker. Non-filled entries have zero cash return instead of receiving
+        # an impossible mark-to-mid profit.
+        long_executable = (
+            (float(future["bid"]) / entry_bid - 1) * 10_000
+            - config.maker_fee_bps_per_side
+            - config.taker_fee_bps_per_side
+            if long_filled
+            else 0.0
+        )
+        short_executable = (
+            (entry_ask / float(future["ask"]) - 1) * 10_000
+            - config.maker_fee_bps_per_side
+            - config.taker_fee_bps_per_side
+            if short_filled
+            else 0.0
+        )
+        output[f"future_long_maker_entry_taker_exit_net_{horizon}s_bps"] = (
+            long_executable
+        )
+        output[f"future_short_maker_entry_taker_exit_net_{horizon}s_bps"] = (
+            short_executable
+        )
+    output["estimated_round_trip_maker_cost_bps"] = 2 * config.maker_fee_bps_per_side
+    output["estimated_round_trip_taker_cost_bps"] = 2 * config.taker_fee_bps_per_side
     return output
 
 
@@ -452,6 +637,11 @@ class GzipJsonlWriter:
             "started_at": started_at,
             "updated_at": time.time(),
             "label_horizons_seconds": list(LABEL_HORIZONS),
+            "maker_fill_proxy": (
+                "opposite-side public trade reaches the resting best bid/ask"
+            ),
+            "executable_label": "maker entry plus taker exit at horizon",
+            "quality_file": "quality.json",
             "universe": universe,
             "rows_written_this_process": self.rows_written,
         }
@@ -459,6 +649,70 @@ class GzipJsonlWriter:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temporary.replace(path)
+
+    def quality(self, payload: dict[str, Any]) -> None:
+        path = self.root / "quality.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+
+class DataQualityMonitor:
+    def __init__(self) -> None:
+        self.started_at = time.time()
+        self.sample_loops = 0
+        self.expected_feature_rows = 0
+        self.observed_feature_rows = 0
+        self.stale_book_drops = 0
+        self.invalid_feature_rows = 0
+        self.emitted_rows = 0
+        self.ws_connections = 0
+        self.ws_reconnects = 0
+        self.book_messages = 0
+        self.trade_messages = 0
+        self.per_symbol_rows: dict[str, int] = {}
+
+    def payload(self, states: dict[str, MarketState], *, now: float) -> dict[str, Any]:
+        completeness = (
+            self.observed_feature_rows / self.expected_feature_rows
+            if self.expected_feature_rows
+            else 0.0
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "read_only": True,
+            "started_at": self.started_at,
+            "updated_at": now,
+            "sample_loops": self.sample_loops,
+            "expected_feature_rows": self.expected_feature_rows,
+            "observed_feature_rows": self.observed_feature_rows,
+            "feature_completeness": completeness,
+            "stale_book_drops": self.stale_book_drops,
+            "invalid_feature_rows": self.invalid_feature_rows,
+            "emitted_labelled_rows": self.emitted_rows,
+            "ws_connections": self.ws_connections,
+            "ws_reconnects": self.ws_reconnects,
+            "book_messages": self.book_messages,
+            "trade_messages": self.trade_messages,
+            "per_symbol_rows": self.per_symbol_rows,
+            "symbols": {
+                inst_id: {
+                    "book_age_ms": (
+                        max(0.0, now - state.last_book_at) * 1000
+                        if state.last_book_at
+                        else -1.0
+                    ),
+                    "trade_age_ms": (
+                        max(0.0, now - state.last_trade_at) * 1000
+                        if state.last_trade_at
+                        else -1.0
+                    ),
+                    "book_events_buffered": len(state.book_events),
+                    "trades_buffered": len(state.trades),
+                }
+                for inst_id, state in states.items()
+            },
+        }
 
 
 async def _public_json(
@@ -475,15 +729,23 @@ async def _public_json(
 async def discover_universe(
     session: aiohttp.ClientSession, config: Config
 ) -> tuple[list[dict[str, Any]], dict[str, InstrumentMeta]]:
-    tickers, instruments_raw = await asyncio.gather(
+    tickers, instruments_raw, spot_raw = await asyncio.gather(
         _public_json(session, "/api/v5/market/tickers", {"instType": "SWAP"}),
         _public_json(session, "/api/v5/public/instruments", {"instType": "SWAP"}),
+        _public_json(session, "/api/v5/public/instruments", {"instType": "SPOT"}),
     )
     instruments = instrument_map(instruments_raw)
+    spot_bases = {
+        str(item.get("baseCcy") or "").upper()
+        for item in spot_raw
+        if str(item.get("state") or "").lower() == "live"
+        and str(item.get("quoteCcy") or "").upper() == "USDT"
+    }
     selected = select_universe(
         tickers,
         instruments,
         now=time.time(),
+        spot_bases=spot_bases,
         excluded=set(config.excluded_bases.split(",")),
         size=config.universe_size,
         min_turnover=config.min_turnover_usdt,
@@ -498,7 +760,7 @@ async def discover_universe(
     return selected, instruments
 
 
-async def _stream(states: dict[str, MarketState]) -> None:
+async def _stream(states: dict[str, MarketState], quality: DataQualityMonitor) -> None:
     args = [
         {"channel": channel, "instId": inst_id}
         for inst_id in states
@@ -509,6 +771,7 @@ async def _stream(states: dict[str, MarketState]) -> None:
             timeout = aiohttp.ClientTimeout(total=None, sock_read=25)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.ws_connect(OKX_PUBLIC_WS, heartbeat=15) as ws:
+                    quality.ws_connections += 1
                     await ws.send_json({"op": "subscribe", "args": args})
                     while True:
                         try:
@@ -528,8 +791,10 @@ async def _stream(states: dict[str, MarketState]) -> None:
                             data = list(payload.get("data") or [])
                             if channel == "books5" and data:
                                 state.update_book(data[-1])
+                                quality.book_messages += 1
                             elif channel == "trades" and data:
                                 state.add_trades(data)
+                                quality.trade_messages += 1
                         elif message.type in {
                             aiohttp.WSMsgType.CLOSED,
                             aiohttp.WSMsgType.ERROR,
@@ -538,6 +803,7 @@ async def _stream(states: dict[str, MarketState]) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
+            quality.ws_reconnects += 1
             await asyncio.sleep(2)
 
 
@@ -549,6 +815,7 @@ async def _collect_generation(
     writer: GzipJsonlWriter,
     report: LiveReport,
     started_at: float,
+    quality: DataQualityMonitor,
 ) -> None:
     states = {
         item["inst_id"]: MarketState(
@@ -559,36 +826,67 @@ async def _collect_generation(
         )
         for item in selected
     }
-    stream = asyncio.create_task(_stream(states))
+    stream = asyncio.create_task(_stream(states, quality))
     deadline = time.monotonic() + config.universe_refresh_minutes * 60
     last_report_at = 0.0
     try:
         while time.monotonic() < deadline:
             await asyncio.sleep(config.sample_interval_ms / 1000)
             now = time.time()
-            rows = [
-                row
-                for state in states.values()
-                if (row := compute_features(state, now=now)) is not None
-                and row["book_age_ms"] <= 5000
-            ]
+            quality.sample_loops += 1
+            quality.expected_feature_rows += len(states)
+            rows: list[dict[str, Any]] = []
+            for state in states.values():
+                row = compute_features(state, now=now)
+                if row is None:
+                    continue
+                if row["book_age_ms"] > 5000:
+                    quality.stale_book_drops += 1
+                    continue
+                rows.append(row)
+            quality.observed_feature_rows += len(rows)
             if not rows:
                 continue
             add_percentiles(rows, states, config.rolling_window_samples)
             add_benchmark_context(rows)
+            valid_rows: list[dict[str, Any]] = []
+            for row in rows:
+                if all(
+                    not isinstance(value, (int, float)) or math.isfinite(value)
+                    for value in row.values()
+                ):
+                    valid_rows.append(row)
+                else:
+                    quality.invalid_feature_rows += 1
+            rows = valid_rows
             output: list[dict[str, Any]] = []
             for row in rows:
                 state = states[row["inst_id"]]
-                state.frames.append((now, float(row["mid"])))
+                state.frames.append(
+                    {
+                        "timestamp": now,
+                        "mid": float(row["mid"]),
+                        "bid": float(row["best_bid"]),
+                        "ask": float(row["best_ask"]),
+                    }
+                )
                 state.pending.append(row)
                 while state.pending:
-                    ready = labelled_row(state.pending[0], state.frames, config)
+                    ready = labelled_row(
+                        state.pending[0], state.frames, state.trades, config
+                    )
                     if ready is None:
                         break
                     output.append(ready)
                     state.pending.popleft()
             if output:
                 writer.write(output)
+                quality.emitted_rows += len(output)
+                for row in output:
+                    inst_id = str(row["inst_id"])
+                    quality.per_symbol_rows[inst_id] = (
+                        quality.per_symbol_rows.get(inst_id, 0) + 1
+                    )
             if now - last_report_at >= 10:
                 stale = sum(now - state.last_book_at > 5 for state in states.values())
                 report.clear()
@@ -599,8 +897,11 @@ async def _collect_generation(
                 report.builder.kpi("Rows written", str(writer.rows_written))
                 report.builder.kpi("Stale books", str(stale))
                 report.builder.kpi(
-                    "Sample interval", f"{config.sample_interval_ms} ms"
+                    "Feature completeness",
+                    f"{quality.payload(states, now=now)['feature_completeness']:.1%}",
                 )
+                report.builder.kpi("WS reconnects", str(quality.ws_reconnects))
+                report.builder.kpi("Sample interval", f"{config.sample_interval_ms} ms")
                 report.builder.kpi("Storage", str(writer.root.resolve()))
                 report.builder.table(
                     [
@@ -615,6 +916,7 @@ async def _collect_generation(
                 )
                 await report.update()
                 writer.manifest(universe=selected, started_at=started_at)
+                writer.quality(quality.payload(states, now=now))
                 last_report_at = now
     finally:
         stream.cancel()
@@ -630,6 +932,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     if not root.is_absolute():
         root = Path(__file__).resolve().parents[3] / root
     writer = GzipJsonlWriter(root)
+    quality = DataQualityMonitor()
     report = LiveReport(
         "OKX Alt Cross-Section Training Collector",
         source_name="okx_alt_training_collector",
@@ -647,4 +950,5 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 writer=writer,
                 report=report,
                 started_at=started_at,
+                quality=quality,
             )
