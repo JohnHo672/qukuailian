@@ -37,6 +37,7 @@ dependencies = [
     # Brings py-vapid and http-ece; cryptography was already here via
     # python-jose[cryptography].
     "pywebpush>=2.5.0",
+    "scikit-learn>=1.9.1",
 ]
 
 [dependency-groups]

@@ -1,0 +1,31 @@
+data_glob: data/research/alt_cross_section/features-*.jsonl.gz
+output_dir: data/research/alt_model_v1
+schema_version: okx-alt-cross-section-v1
+exclude_latest_file: true
+target_column: future_return_30s_bps
+sample_seconds: 10
+decision_seconds: 30
+embargo_seconds: 60
+chunk_rows: 100000
+max_train_rows: 300000
+min_symbol_rows: 500
+holdout_symbol_fraction: 0.2
+random_state: 672
+max_book_age_ms: 2000
+max_trade_age_ms: 5000
+maker_round_trip_bps: 4.0
+slippage_bps: 1.0
+adverse_fill_bps: 1.5
+fill_probability: 0.6
+min_calibration_trades: 50
+non_crypto_bases:
+  - BZ
+  - CL
+  - CRCL
+  - KORU
+  - MRVL
+  - MU
+  - SKHYNIX
+  - SNDK
+  - SOXL
+  - SPCX
